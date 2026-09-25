@@ -20,6 +20,38 @@ const SORT_FIELDS = {
     "date updated": 3,
 };
 
+const MAX_RESULTS = 10000;
+
+const CATEGORY_NAMES = {
+    "adventure": ["Adventure and RPG", "Adventure"],
+    "challenging": ["Hardcore", "Expert"],
+    "combat": ["Combat / PvP"],
+    "equipment": ["Armor, Tools, and Weapons"],
+    "fantasy": ["Fantasy"],
+    "fonts": ["Font Packs"],
+    "food": ["Food"],
+    "kitchen-sink": ["Extra Large"],
+    "library": ["API and Library", "Library"],
+    "lightweight": ["Small / Light"],
+    "magic": ["Magic"],
+    "management": ["Server Utility"],
+    "minigame": ["Mini Game"],
+    "mobs": ["Mobs"],
+    "modded": ["Mod Support"],
+    "multiplayer": ["Multiplayer"],
+    "optimization": ["Performance", "Small / Light"],
+    "quests": ["Quests"],
+    "realistic": ["Photo Realistic", "Realistic"],
+    "semi-realistic": ["Realistic"],
+    "storage": ["Storage"],
+    "technology": ["Technology", "Tech"],
+    "transportation": ["Player Transport"],
+    "utility": ["Utility & QoL", "Utility"],
+    "vanilla-like": ["Vanilla", "Traditional", "Vanilla+"],
+    "worldgen": ["World Gen"],
+    "512x+": ["512x and Higher"],
+};
+
 const DROPDOWN_BUTTON_CLASSES = "relative inline-flex shrink-0 items-center justify-center whitespace-nowrap border-0 no-underline touch-manipulation cursor-pointer select-none transition-[background-color,color,box-shadow,filter,opacity,transform] duration-150 ease-out enabled:active:scale-[0.97] focus-visible:outline-none button-frame--base bg-surface-4 text-contrast [&>svg]:text-primary h-9 gap-1 rounded-xl px-2.5 text-sm font-semibold leading-5 text-left";
 
 const CHEVRON = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" viewBox="0 0 24 24" class="size-4 shrink-0 transition-transform duration-150 -rotate-90"><path d="m15 18-6-6 6-6"/></svg>`;
@@ -105,14 +137,17 @@ function currentPageNumber() {
 function readFilters() {
     const loaders = [];
     const versions = [];
-    const categories = [];
 
     for (const chip of activeChips()) {
         const key = chip.toLowerCase();
         if (LOADER_IDS[key]) loaders.push(key);
         else if (/^\d/.test(chip)) versions.push(chip);
-        else categories.push(chip);
     }
+
+    const query = new URLSearchParams(location.search);
+    const categories = query.getAll("f")
+        .filter(value => value.startsWith("categories:"))
+        .map(value => value.slice("categories:".length));
 
     const pageSize = parseInt(dropdownValue("View"), 10) || 20;
     return {
@@ -120,6 +155,8 @@ function readFilters() {
         loader: loaders[0] || null,
         gameVersion: versions[0] || null,
         categories,
+        unsupported: query.has("e") || query.has("l"),
+        hideInstalled: query.get("ai") === "true",
         sort: dropdownValue("Sort by").toLowerCase(),
         pageSize: Math.min(pageSize, 50),
         page: currentPageNumber(),
@@ -128,22 +165,33 @@ function readFilters() {
 
 const signature = filters => JSON.stringify([location.pathname, filters]);
 
-async function categoryIdsFor(names) {
-    if (!names.length) return [];
+async function categoryIdsFor(slugs) {
+    if (!slugs.length) return { ids: [], missing: [] };
     if (!categoryIds) {
         const data = await cfGet(
             `/v1/categories?gameId=${GAME_MINECRAFT}&classId=${currentPageKind().classId}`);
         categoryIds = new Map((data.data || []).map(c => [c.name.toLowerCase(), c.id]));
     }
-    return names.map(n => categoryIds.get(n.toLowerCase())).filter(Boolean);
+
+    const ids = [];
+    const missing = [];
+    for (const slug of slugs) {
+        const id = (CATEGORY_NAMES[slug] || [slug.replace(/-/g, " ")])
+            .map(name => categoryIds.get(name.toLowerCase()))
+            .find(Boolean);
+        if (id) ids.push(id);
+        else missing.push(slug.replace(/-/g, " "));
+    }
+    return { ids: [...new Set(ids)], missing };
 }
 
 async function buildParams(filters, instance) {
+    const page = Math.min(filters.page, Math.floor(MAX_RESULTS / filters.pageSize));
     const params = new URLSearchParams({
         gameId: String(GAME_MINECRAFT),
         classId: String(currentPageKind().classId),
         pageSize: String(filters.pageSize),
-        index: String((filters.page - 1) * filters.pageSize),
+        index: String((page - 1) * filters.pageSize),
         sortField: String(SORT_FIELDS[filters.sort] ?? 1),
         sortOrder: "desc",
     });
@@ -158,11 +206,30 @@ async function buildParams(filters, instance) {
         params.set("modLoaderType", String(LOADER_IDS[loader]));
     }
 
-    const ids = await categoryIdsFor(filters.categories);
+    const { ids, missing } = await categoryIdsFor(filters.categories);
     if (ids.length === 1) params.set("categoryId", String(ids[0]));
     else if (ids.length > 1) params.set("categoryIds", JSON.stringify(ids));
 
-    return params;
+    const ignored = [];
+    if (missing.length) ignored.push(`CurseForge has no ${missing.map(name => `"${name}"`).join(", ")} category, so it isn't applied.`);
+    if (filters.unsupported) ignored.push("Environment and license filters don't apply to CurseForge.");
+    return { params, ignored };
+}
+
+const pagerCounts = new WeakMap();
+let cfPageCount = null;
+
+function applyPageCount() {
+    const pagers = findComponents((component, vnode) => (vnode.type.__name || vnode.type.name) === "Pagination");
+    for (const pager of pagers) {
+        if (cfPageCount === null) {
+            if (pagerCounts.has(pager)) pager.props.count = pagerCounts.get(pager);
+            pagerCounts.delete(pager);
+        } else if (pager.props.count !== cfPageCount) {
+            pagerCounts.set(pager, pager.props.count);
+            pager.props.count = cfPageCount;
+        }
+    }
 }
 
 const appBuild = () => document.querySelector('script[src^="/assets/index-"]')?.getAttribute("src") || "";
@@ -269,7 +336,7 @@ function fillCard(card, mod, instance, present) {
 
 const installKey = (instance, mod) => `installed:${instance.id}:${mod.id}`;
 
-async function installedFileNames(instance) {
+async function installedIn(instance) {
     if (!instance) return null;
     try {
         const [items, pack] = await Promise.all([
@@ -277,7 +344,11 @@ async function installedFileNames(instance) {
             ML.invoke("plugin:instance|instance_get_linked_modpack_content", { instanceId: instance.id })
                 .catch(() => []),
         ]);
-        return new Set([...items, ...(pack || [])].map(i => i.file_name).filter(Boolean));
+        const all = [...items, ...(pack || [])];
+        return {
+            files: new Set(all.map(i => i.file_name).filter(Boolean)),
+            projects: await ML.project.curseForgeProjects(instance.id, all).catch(() => new Map()),
+        };
     } catch {
         return null;
     }
@@ -299,7 +370,7 @@ function rewireInstallButton(card, mod, instance, present) {
 
     if (instance && !currentPageKind()?.pack) {
         const remembered = ML.settings.get(installKey(instance, mod));
-        if (remembered && present?.has(remembered)) {
+        if (present?.projects.has(mod.id) || (remembered && present?.files.has(remembered))) {
             ML.markButtonDone(button, "Installed");
             return;
         }
@@ -410,14 +481,14 @@ async function modSlug(modId) {
     }
 }
 
-function alreadyInstalled(slug, fileName, present) {
+function alreadyInstalled(dep, slug, present) {
     if (!present) return false;
-    if (present.has(fileName)) return true;
+    if (present.projects.has(dep.modId) || present.files.has(dep.fileName)) return true;
     if (!slug) return false;
 
     const normalise = value => value.toLowerCase().replace(/[_\s]+/g, "-");
     const wanted = normalise(slug);
-    return [...present].some(name => normalise(name).includes(wanted));
+    return [...present.files].some(name => normalise(name).includes(wanted));
 }
 
 async function requiredDependencies(file, instance, kind, seen) {
@@ -441,24 +512,28 @@ async function installMod(mod, instance, report, allowAny = false) {
     const kind = currentPageKind();
 
     report("Finding...");
-    let file = pickFile(await filesFor(mod.id, instance, kind));
+    let files = await filesFor(mod.id, instance, kind);
+    let file = pickFile(files);
 
-    if (!file && allowAny) file = pickFile(await allFilesFor(mod.id));
-    if (!file) throw new Error("No matching file");
+    if (!file && allowAny) {
+        files = await allFilesFor(mod.id);
+        file = pickFile(files);
+    }
+    if (!file) throw new Error(files.length ? "Author blocked downloads" : "No matching file");
 
     await installFile(file, mod.id, instance, kind, report);
     return file.fileName;
 }
 
 async function installFile(file, modId, instance, kind, report = () => {}) {
-    const present = await installedFileNames(instance);
+    const present = await installedIn(instance);
     const seen = new Set([modId]);
     const resolved = kind.loaders ? await requiredDependencies(file, instance, kind, seen) : [];
 
     const dependencies = [];
     for (const dep of resolved) {
         const slug = await modSlug(dep.modId);
-        if (alreadyInstalled(slug, dep.fileName, present)) continue;
+        if (alreadyInstalled(dep, slug, present)) continue;
         dependencies.push(dep);
     }
 
@@ -471,19 +546,24 @@ async function installFile(file, modId, instance, kind, report = () => {}) {
 
     report("Downloading...");
     await placeFile(file, instance, kind);
+
+    const placed = `${kind.folder}/${file.fileName}`;
+    for (const path of present?.projects.get(modId) || []) {
+        if (path !== placed) await removeContent(instance.id, path);
+    }
     return dependencies;
 }
 
-function findComponent(match) {
+function findComponents(match, first = false) {
     const root = document.querySelector("#app")?._vnode;
-    let found = null;
+    const found = [];
     const seen = new Set();
 
     const visit = (vnode, depth) => {
-        if (!vnode || found || depth > 80 || typeof vnode !== "object" || seen.has(vnode)) return;
+        if (!vnode || (first && found.length) || depth > 80 || typeof vnode !== "object" || seen.has(vnode)) return;
         seen.add(vnode);
         if (vnode.component && match(vnode.component, vnode)) {
-            found = vnode.component;
+            found.push(vnode.component);
             return;
         }
         if (vnode.component) visit(vnode.component.subTree, depth + 1);
@@ -494,6 +574,8 @@ function findComponent(match) {
     visit(root, 0);
     return found;
 }
+
+const findComponent = match => findComponents(match, true)[0] || null;
 
 const findMountedComponent = name =>
     findComponent((component, vnode) => (vnode.type.__name || vnode.type.name) === name);
@@ -557,7 +639,7 @@ async function openInstallModal(mod, kind) {
             ? `http://asset.localhost/${encodeURIComponent(instance.icon_path)}`
             : undefined,
         compatible: usable.some(file => fileSupports(file, instance, kind)),
-        installed: !!ML.settings.get(installKey(instance, mod)),
+        installed: false,
         installing: false,
         instance,
     }));
@@ -565,6 +647,14 @@ async function openInstallModal(mod, kind) {
     const draw = () => {
         dialog.props.instances = entries.map(entry => ({ ...entry }));
     };
+
+    for (const entry of entries) {
+        installedIn(entry.instance).then(present => {
+            if (!present?.projects.has(mod.id) || entry.installed) return;
+            entry.installed = true;
+            draw();
+        });
+    }
 
     const install = async entry => {
         entry.installing = true;
@@ -1058,6 +1148,7 @@ async function applyPack(pack, instanceId, previous, report, reset = false) {
 
     const entries = pack.manifest.files || [];
     const files = [];
+    const manual = [];
     let done = 0;
     let blocked = 0;
 
@@ -1068,9 +1159,18 @@ async function applyPack(pack, instanceId, previous, report, reset = false) {
                 files.push(old);
             } else {
                 const packFile = (await cfGet(`/v1/mods/${entry.projectID}/files/${entry.fileID}`)).data;
-                if (!packFile?.downloadUrl) throw new Error("blocked");
-
                 const project = await modInfo(entry.projectID);
+                if (!packFile?.downloadUrl) {
+                    const site = project?.links?.websiteUrl || `https://www.curseforge.com/projects/${entry.projectID}`;
+                    manual.push({
+                        projectID: entry.projectID,
+                        fileID: entry.fileID,
+                        name: project?.name || packFile?.displayName || packFile?.fileName || `Project ${entry.projectID}`,
+                        url: `${site}/download/${entry.fileID}`,
+                    });
+                    throw new Error("blocked");
+                }
+
                 const kind = KINDS.find(candidate => candidate.folder && candidate.classId === project?.classId) || KINDS[0];
                 const path = `${kind.folder}/${packFile.fileName}`;
                 const wasDisabled = old && disabled.has(old.path);
@@ -1093,7 +1193,7 @@ async function applyPack(pack, instanceId, previous, report, reset = false) {
     for (const path of [...before.map(item => item.path), ...(previous?.overrides || [])]) {
         if (!kept.has(path)) await removeContent(instanceId, path);
     }
-    return { files, overrides, blocked, total: entries.length };
+    return { files, overrides, manual, blocked, total: entries.length };
 }
 
 async function installPackFile(file, mod, report = () => {}, options = {}) {
@@ -1114,7 +1214,7 @@ async function installPackFile(file, mod, report = () => {}, options = {}) {
         await waitForInstance(instanceId, report);
         const result = await applyPack(pack, instanceId, null, report);
         ML.settings.set(packKey(instanceId),
-            { modId: mod.id, fileId: file.id, files: result.files, overrides: result.overrides });
+            { modId: mod.id, fileId: file.id, files: result.files, overrides: result.overrides, blocked: result.manual });
 
         ML.refresh();
         return { instanceId, total: result.total, blocked: result.blocked };
@@ -1141,7 +1241,7 @@ async function updatePack(instanceId, fileId, reset = false) {
 
         const result = await applyPack(pack, instanceId, previous, () => {}, reset);
         ML.settings.set(packKey(instanceId),
-            { modId: previous.modId, fileId: file.id, files: result.files, overrides: result.overrides });
+            { modId: previous.modId, fileId: file.id, files: result.files, overrides: result.overrides, blocked: result.manual });
 
         const instance = await ML.invoke("plugin:instance|instance_get", { instanceId });
         const loaderVersion = pack.loader.version;
@@ -1184,6 +1284,8 @@ function showModrinth() {
     }
     ourResults()?.remove();
     lastSignature = null;
+    cfPageCount = null;
+    applyPageCount();
 }
 
 function showCurseForge() {
@@ -1216,17 +1318,23 @@ async function runSearch(force = false) {
 
     try {
         const instance = await currentInstance();
-        const present = await installedFileNames(instance);
-        const params = await buildParams(filters, instance);
+        const present = await installedIn(instance);
+        const { params, ignored } = await buildParams(filters, instance);
         const [data, ready] = await Promise.all([
             cfGet(`/v1/mods/search?${params}`),
             whenTemplateReady(),
         ]);
         if (lastSignature !== current) return;
 
-        const mods = data.data || [];
+        const total = Math.min(data.pagination?.totalCount || 0, MAX_RESULTS);
+        cfPageCount = Math.max(1, Math.ceil(total / filters.pageSize));
+        applyPageCount();
+
+        const mods = (data.data || []).filter(mod => !filters.hideInstalled || !present?.projects.has(mod.id));
         if (!mods.length) {
-            message(box, "Nothing on CurseForge matched these filters.");
+            message(box, filters.page > cfPageCount
+                ? "There are no more CurseForge results. Go back a page."
+                : "Nothing on CurseForge matched these filters.");
             return;
         }
         if (!ready) {
@@ -1241,7 +1349,9 @@ async function runSearch(force = false) {
             fillCard(card, mod, instance, present);
             list.appendChild(card);
         }
-        box.replaceChildren(list);
+        box.replaceChildren();
+        if (ignored.length) message(box, ignored.join(" "));
+        box.appendChild(list);
     } catch (e) {
         message(box, `CurseForge search failed: ${e.message}`);
     }
@@ -1354,6 +1464,56 @@ function withScope(element, selector) {
     const scope = cssScopes.get(selector);
     if (scope) element.setAttribute(scope, "");
     return element;
+}
+
+function blockedNotice(blocked) {
+    const box = document.createElement("div");
+    box.id = "ven-blocked";
+    box.dataset.count = String(blocked.length);
+    box.className = "relative grid grid-cols-[1.5rem_minmax(0,1fr)_auto] gap-x-2 rounded-2xl border border-solid p-4 text-contrast items-start border-brand-orange bg-bg-orange";
+
+    const icon = document.createElement("div");
+    icon.className = "h-6 w-6 flex-none text-brand-orange";
+    icon.innerHTML = WARN_ICON;
+
+    const column = document.createElement("div");
+    column.className = "col-start-2 min-w-0 flex flex-1 flex-col gap-2";
+    column.append(
+        text("div", "flex flex-wrap items-center gap-2 text-lg font-semibold leading-6",
+            `${blocked.length === 1 ? "1 file needs" : `${blocked.length} files need`} to be downloaded by hand`),
+        text("div", "font-normal text-contrast/85 leading-tight",
+            "Their authors only allow downloads from the CurseForge website. Download each one, then drop the files on this page."),
+    );
+
+    const actions = document.createElement("div");
+    actions.className = "mt-2 flex flex-wrap gap-2";
+    for (const entry of blocked) {
+        const button = modalButton(entry.name, V.outlined, DOWNLOAD_ICON);
+        button.addEventListener("click", () => ML.invoke("plugin:opener|open_url", { url: entry.url }));
+        actions.appendChild(button);
+    }
+    column.appendChild(actions);
+
+    box.append(icon, column);
+    return box;
+}
+
+function showBlocked() {
+    const match = location.pathname.match(/^\/instance\/([^/]+)\/?$/);
+    const blocked = (match && packOf(decodeURIComponent(match[1]))?.blocked) || [];
+    const existing = document.getElementById("ven-blocked");
+    const card = blocked.length
+        ? [...document.querySelectorAll(".app-viewport h2")]
+            .find(heading => heading.textContent.trim() === "Modpack content")?.closest("section")
+        : null;
+
+    if (!card) {
+        existing?.remove();
+        return;
+    }
+    if (existing?.nextElementSibling === card && existing.dataset.count === String(blocked.length)) return;
+    existing?.remove();
+    card.before(blockedNotice(blocked));
 }
 
 function modalButton(label, classes, svg) {
@@ -1509,6 +1669,7 @@ function mount() {
     const native = findResults();
     if (native && native.style.display !== "none") native.style.display = "none";
     ourResults(true);
+    if (cfPageCount !== null) applyPageCount();
 
     clearTimeout(searchTimer);
     searchTimer = setTimeout(() => runSearch(), 350);
@@ -1528,6 +1689,7 @@ const observer = new MutationObserver(() => {
     requestAnimationFrame(() => {
         scheduled = false;
         mount();
+        showBlocked();
     });
 });
 
@@ -1551,6 +1713,7 @@ ML.cf = {
     installPackFile,
     updatePack,
     pack: packOf,
+    savePack: (instanceId, pack) => ML.settings.set(packKey(instanceId), pack),
     forgetPack,
     releaseName,
     LOADER_IDS,
@@ -1562,5 +1725,6 @@ ML.cleanups.push(() => {
     listeners.abort();
     clearTimeout(searchTimer);
     document.getElementById("ven-platform")?.remove();
+    document.getElementById("ven-blocked")?.remove();
     showModrinth();
 });

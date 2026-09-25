@@ -11,7 +11,7 @@ window.__venBackendReply = (id, status, body) => {
         data = JSON.parse(body);
     } catch {}
     if (status >= 200 && status < 300) call.resolve(data);
-    else call.reject(new Error(data?.error || `backend error ${status}`));
+    else call.reject(new Error(data?.error || data?.errorMessage || `backend error ${status}`));
 };
 
 ML.backend = {

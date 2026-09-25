@@ -74,7 +74,7 @@ async function projectV3(modId) {
         name: info.name,
         summary: info.summary || "",
         description,
-        categories: (info.categories || []).map(category => category.slug || category.name),
+        categories: (info.categories || []).map(category => category.name),
         additional_categories: [],
         project_types: [ML.cf.KINDS.find(kind => kind.classId === info.classId)?.projectType || "mod"],
         games: ["minecraft-java"],
@@ -255,7 +255,8 @@ async function installFromPage(args) {
     ]);
     const instance = instances.find(candidate => candidate.id === instanceId);
     const file = match ? files.find(candidate => candidate.id === Number(match[2])) : files[0];
-    if (!instance || !file) throw new Error("no such instance or version");
+    if (!instance) throw new Error("no such instance");
+    if (!file) throw new Error(files.length ? "no such version" : "Author blocked downloads");
 
     const dependencies = await ML.cf.installFile(file, modId, instance, kind);
     ML.settings.set(`installed:${instanceId}:${modId}`, file.fileName);
@@ -438,6 +439,42 @@ function asContent(item, match, info, instance) {
     };
 }
 
+async function curseForgeProjects(instanceId, items) {
+    await ML.cfKey.ready;
+    if (!ML.cfKey.saved) return new Map();
+
+    const content = items.filter(item => item.file_path && kindOf(item.file_path));
+    const found = await matchFiles(instanceId, content);
+    const projects = new Map();
+    content.forEach((item, index) => {
+        const match = found[index];
+        if (match) projects.set(match.modId, [...(projects.get(match.modId) || []), item.file_path]);
+    });
+    return projects;
+}
+
+async function withProjectIds(projects, args) {
+    await ML.cfKey.ready;
+    if (!ML.cfKey.saved || !projects || typeof projects !== "object") return projects;
+
+    const unknown = Object.entries(projects)
+        .filter(([path, entry]) => !entry.metadata && kindOf(path))
+        .map(([path, entry]) => ({ id: entry.hash, file_path: path, size: entry.size, enabled: entry.enabled }));
+    if (!unknown.length) return projects;
+
+    const found = await matchFiles(args.instanceId, unknown);
+    const result = { ...projects };
+    unknown.forEach((item, index) => {
+        const match = found[index];
+        if (!match) return;
+        result[item.file_path] = {
+            ...projects[item.file_path],
+            metadata: { project_id: projectId(match.modId), version_id: versionId(match.modId, match.file.id) },
+        };
+    });
+    return result;
+}
+
 async function withCurseForge(items, instanceId) {
     await ML.cfKey.ready;
     if (!ML.cfKey.saved || !Array.isArray(items)) return items;
@@ -472,7 +509,8 @@ async function switchVersion(args) {
         fileFor(modId, fileId),
         ML.invoke("plugin:instance|instance_get_content_items", { instanceId }),
     ]);
-    if (!instance || !kind || !file?.downloadUrl) throw new Error("no such instance or version");
+    if (!instance || !kind || !file) throw new Error("no such instance or version");
+    if (!file.downloadUrl) throw new Error("Author blocked downloads");
 
     const disabled = items.find(item => item.file_path === projectPath)?.enabled === false;
     const toggle = (path, enabled) => ML.invoke("plugin:instance|instance_toggle_disable_project",
@@ -484,7 +522,7 @@ async function switchVersion(args) {
     try {
         await ML.cf.installFile(file, modId, instance, kind);
         if (projectPath !== placed) {
-            await ML.invoke("plugin:instance|instance_remove_project", { instanceId, projectPath });
+            await ML.invoke("plugin:instance|instance_remove_project", { instanceId, projectPath }).catch(() => {});
         }
         current = placed;
     } finally {
@@ -511,8 +549,23 @@ const packPaths = pack => new Set([...pack.files.map(file => file.path), ...(pac
 
 async function contentFor(items, args) {
     const all = await withCurseForge(items, args.instanceId);
-    const pack = ML.cf.pack(args.instanceId);
+    let pack = ML.cf.pack(args.instanceId);
     if (!pack || !Array.isArray(all)) return all;
+
+    if (pack.blocked?.length) {
+        const present = await curseForgeProjects(args.instanceId, all).catch(() => new Map());
+        const added = pack.blocked.filter(entry => present.has(entry.projectID));
+        if (added.length) {
+            pack = {
+                ...pack,
+                files: [...pack.files, ...added.map(entry =>
+                    ({ projectID: entry.projectID, fileID: entry.fileID, path: present.get(entry.projectID)[0] }))],
+                blocked: pack.blocked.filter(entry => !present.has(entry.projectID)),
+            };
+            ML.cf.savePack(args.instanceId, pack);
+            ML.refresh();
+        }
+    }
 
     everything.set(args.instanceId, all);
     const paths = packPaths(pack);
@@ -636,9 +689,10 @@ function isOurs(command, args) {
 }
 
 const MODRINTH_LINK = /^https:\/\/modrinth\.com\/[a-z]+\/cf(\d+)(?:\/version\/cfv\d+x(\d+))?/;
+const MODRINTH_REPORT = /^https:\/\/modrinth\.com\/report\?item=(?:project|version)&itemID=cfv?(\d+)(?:x(\d+))?/;
 
 async function curseForgeUrl(url) {
-    const match = MODRINTH_LINK.exec(url || "");
+    const match = MODRINTH_LINK.exec(url || "") || MODRINTH_REPORT.exec(url || "");
     if (!match) return null;
     const site = (await ML.cf.info(Number(match[1])))?.links?.websiteUrl;
     if (!site) return null;
@@ -659,6 +713,7 @@ const RESULTS = {
     "plugin:instance|instance_list": withPackLinks,
     "plugin:instance|instance_get_many": withPackLinks,
     "plugin:instance|instance_get_content_items": contentFor,
+    "plugin:instance|instance_get_projects": withProjectIds,
     "plugin:instance|instance_update_all": (result, args) => updateCurseForge(args.instanceId).then(() => result),
     "plugin:instance|instance_edit": (result, args) => {
         if (args.editInstance?.link === null) ML.cf.forgetPack(args.instanceId);
@@ -813,6 +868,20 @@ function hookFetch() {
 
 hookFetch();
 
+function hookClipboard() {
+    const clipboard = navigator.clipboard;
+    const original = clipboard?.writeText;
+    if (!original) return;
+
+    const hooked = async text => original.call(clipboard, (await curseForgeUrl(text).catch(() => null)) || text);
+    clipboard.writeText = hooked;
+    ML.cleanups.push(() => {
+        if (clipboard.writeText === hooked) clipboard.writeText = original;
+    });
+}
+
+hookClipboard();
+
 const appRouter = () => document.querySelector("#app")?.__vue_app__?.config?.globalProperties?.$router;
 
 function waitFor(check, timeout = 5000) {
@@ -868,6 +937,7 @@ if (!hookRouter()) {
 }
 
 ML.project = {
+    curseForgeProjects,
     path: modId => `/project/${projectId(modId)}`,
     open(modId) {
         const router = appRouter();
