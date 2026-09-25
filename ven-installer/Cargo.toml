@@ -1,0 +1,17 @@
+[package]
+name = "ven-installer"
+version = "0.0.1"
+edition = "2021"
+
+[[bin]]
+name = "VenInstaller"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.28", default-features = false, features = ["glow", "default_fonts"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true

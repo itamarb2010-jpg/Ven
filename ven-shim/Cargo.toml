@@ -1,0 +1,22 @@
+[package]
+name = "ven-shim"
+version = "0.0.1"
+edition = "2021"
+
+[[bin]]
+name = "Ven"
+path = "src/main.rs"
+
+[dependencies]
+ureq = "2.10"
+tungstenite = "0.24"
+serde_json = "1"
+tiny_http = "0.12"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

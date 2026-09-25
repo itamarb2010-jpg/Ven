@@ -1,0 +1,9 @@
+config.local.json
+node_modules/
+target/
+dist/
+*.log
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

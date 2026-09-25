@@ -1,0 +1,566 @@
+const CF_PROJECT = /^cf(\d+)$/;
+const CF_VERSION = /^cfv(\d+)x(\d+)$/;
+const CF_TEAM = /^cft(\d+)$/;
+
+const projectId = modId => `cf${modId}`;
+const versionId = (modId, fileId) => `cfv${modId}x${fileId}`;
+const teamId = modId => `cft${modId}`;
+
+const modIdOf = id => Number(CF_PROJECT.exec(id || "")?.[1]) || null;
+const teamModIdOf = id => Number(CF_TEAM.exec(id || "")?.[1]) || null;
+
+
+
+const LINK_FIELDS = { websiteUrl: "website", issuesUrl: "issues", sourceUrl: "source", wikiUrl: "wiki" };
+
+const fileCache = new Map();
+
+function filesFor(modId) {
+    if (!fileCache.has(modId)) {
+        fileCache.set(modId, ML.cf.files(modId).then(files => files.filter(file => file.downloadUrl)));
+    }
+    return fileCache.get(modId);
+}
+
+const descriptions = new Map();
+
+function descriptionFor(modId) {
+    if (!descriptions.has(modId)) {
+        descriptions.set(modId, ML.cf.get(`/v1/mods/${modId}/description`)
+            .then(data => ML.cf.decodeChangelog(data.data || ""))
+            .catch(() => ""));
+    }
+    return descriptions.get(modId);
+}
+
+const gameVersionsOf = files =>
+    [...new Set(files.flatMap(file => (file.gameVersions || []).filter(tag => /^\d/.test(tag))))];
+
+const loadersOf = files =>
+    [...new Set(files.flatMap(file =>
+        (file.gameVersions || []).map(tag => tag.toLowerCase()).filter(tag => ML.cf.LOADER_IDS[tag])))];
+
+function linksOf(info) {
+    const urls = {};
+    for (const [field, platform] of Object.entries(LINK_FIELDS)) {
+        const url = info.links?.[field];
+        if (url) urls[platform] = { donation: false, platform, url };
+    }
+    return urls;
+}
+
+const galleryOf = info => (info.screenshots || []).map((shot, index) => ({
+    created: info.dateCreated,
+    description: shot.description || null,
+    featured: false,
+    name: shot.title || null,
+    ordering: index,
+    raw_url: shot.url,
+    url: shot.thumbnailUrl || shot.url,
+}));
+
+async function projectV3(modId) {
+    const [info, description, files] = await Promise.all([
+        ML.cf.info(modId),
+        descriptionFor(modId),
+        filesFor(modId),
+    ]);
+    if (!info) return null;
+
+    return {
+        id: projectId(modId),
+        slug: projectId(modId),
+        name: info.name,
+        summary: info.summary || "",
+        description,
+        categories: (info.categories || []).map(category => category.slug || category.name),
+        additional_categories: [],
+        project_types: [ML.cf.KINDS.find(kind => kind.classId === info.classId)?.projectType || "mod"],
+        games: ["minecraft-java"],
+        environment: [],
+        downloads: info.downloadCount || 0,
+        followers: info.thumbsUpCount || 0,
+        icon_url: info.logo?.thumbnailUrl || info.logo?.url || null,
+        raw_icon_url: info.logo?.url || null,
+        color: null,
+        gallery: galleryOf(info),
+        game_versions: gameVersionsOf(files),
+        loaders: loadersOf(files),
+        versions: [...files].sort((a, b) => new Date(a.fileDate) - new Date(b.fileDate))
+            .map(file => versionId(modId, file.id)),
+        license: { id: "LicenseRef-Unknown", name: "Unknown", url: null },
+        link_urls: linksOf(info),
+        team_id: teamId(modId),
+        organization: null,
+        published: info.dateCreated,
+        updated: info.dateModified,
+        approved: info.dateReleased || info.dateCreated,
+        queued: null,
+        status: "approved",
+        requested_status: null,
+        moderator_message: null,
+        monetization_status: null,
+        thread_id: null,
+        side_types_migration_review_status: "reviewed",
+        minecraft_mod: null,
+        minecraft_server: null,
+        minecraft_java_server: null,
+        minecraft_bedrock_server: null,
+    };
+}
+
+async function projectV2(modId) {
+    const [info, project] = await Promise.all([ML.cf.info(modId), projectV3(modId)]);
+    if (!info || !project) return null;
+
+    return {
+        id: project.id,
+        slug: project.slug,
+        project_type: project.project_types[0],
+        team: project.team_id,
+        organization: null,
+        title: project.name,
+        description: project.summary,
+        body: project.description,
+        published: project.published,
+        updated: project.updated,
+        approved: project.approved,
+        status: "approved",
+        license: project.license,
+        client_side: "unknown",
+        server_side: "unknown",
+        downloads: project.downloads,
+        followers: project.followers,
+        categories: project.categories,
+        additional_categories: [],
+        game_versions: project.game_versions,
+        loaders: project.loaders,
+        versions: project.versions,
+        icon_url: project.icon_url,
+        raw_icon_url: project.raw_icon_url,
+        issues_url: info.links?.issuesUrl || null,
+        source_url: info.links?.sourceUrl || null,
+        wiki_url: info.links?.wikiUrl || null,
+        discord_url: null,
+        donation_urls: [],
+        gallery: project.gallery,
+        color: null,
+    };
+}
+
+function asVersion(file, modId, info, featured) {
+    const tags = file.gameVersions || [];
+    const required = (file.dependencies || []).filter(dep => dep.relationType === 3);
+
+    return {
+        id: versionId(modId, file.id),
+        project_id: projectId(modId),
+        author_id: `cfa${modId}`,
+        featured,
+        name: file.displayName || file.fileName,
+        version_number: ML.cf.versionLabel(file, info),
+        changelog: null,
+        changelog_url: null,
+        date_published: file.fileDate,
+        downloads: file.downloadCount || 0,
+        version_type: ML.cf.releaseName(file).toLowerCase(),
+        files: [{
+            hashes: Object.fromEntries((file.hashes || [])
+                .map(hash => [hash.algo === 1 ? "sha1" : "md5", hash.value])),
+            url: file.downloadUrl,
+            filename: file.fileName,
+            primary: true,
+            size: file.fileLength || 0,
+            file_type: null,
+        }],
+        dependencies: required.map(dep => ({
+            version_id: null,
+            project_id: projectId(dep.modId),
+            file_name: null,
+            dependency_type: "required",
+        })),
+        game_versions: tags.filter(tag => /^\d/.test(tag)),
+        loaders: tags.map(tag => tag.toLowerCase()).filter(tag => ML.cf.LOADER_IDS[tag]),
+    };
+}
+
+async function versionsFor(args) {
+    const ids = args.ids || [];
+    const theirs = ids.filter(id => !CF_VERSION.test(id));
+    const [ours, rest] = await Promise.all([
+        curseForgeVersions(ids),
+        theirs.length ? ML.invoke("plugin:cache|get_version_many", { ...args, ids: theirs }) : [],
+    ]);
+    return [...(rest || []), ...ours];
+}
+
+async function curseForgeVersions(ids) {
+    const wanted = ids.map(id => CF_VERSION.exec(id)).filter(Boolean)
+        .map(match => ({ modId: Number(match[1]), fileId: Number(match[2]) }));
+    const modIds = [...new Set(wanted.map(entry => entry.modId))];
+
+    const byMod = new Map();
+    await Promise.all(modIds.map(async modId => {
+        const [info, files] = await Promise.all([ML.cf.info(modId), filesFor(modId)]);
+        byMod.set(modId, { info, files });
+    }));
+
+    return wanted.map(({ modId, fileId }) => {
+        const { info, files } = byMod.get(modId) || {};
+        const file = files.find(candidate => candidate.id === fileId);
+        return file ? asVersion(file, modId, info, file.id === files[0].id) : null;
+    }).filter(Boolean);
+}
+
+const authors = new Map();
+
+function rememberAuthors(info) {
+    for (const author of info?.authors || []) {
+        authors.set(`cfu${author.id}`, { author, created: info.dateCreated });
+    }
+    const first = info?.authors?.[0];
+    if (first) authors.set(`cfa${info.id}`, { author: first, created: info.dateCreated });
+}
+
+async function teamFor(modId) {
+    const info = await ML.cf.info(modId);
+    rememberAuthors(info);
+    return (info?.authors || []).map((author, index) => ({
+        team_id: teamId(modId),
+        user: {
+            id: `cfu${author.id}`,
+            username: author.name,
+            avatar_url: author.avatarUrl || "",
+            bio: null,
+            created: info.dateCreated,
+            role: "developer",
+            badges: 0,
+        },
+        is_owner: index === 0,
+        role: index === 0 ? "Owner" : "Member",
+        ordering: index,
+    }));
+}
+
+
+async function installFromPage(args) {
+    const { instanceId, request } = args;
+    const modId = modIdOf(request.project_id);
+    const match = CF_VERSION.exec(request.version_id || "");
+    const kind = ML.cf.KINDS.find(candidate => candidate.folder && candidate.projectType === request.content_type) || ML.cf.KINDS[0];
+
+    const [instances, files] = await Promise.all([
+        ML.invoke("plugin:instance|instance_list"),
+        filesFor(modId),
+    ]);
+    const instance = instances.find(candidate => candidate.id === instanceId);
+    const file = match ? files.find(candidate => candidate.id === Number(match[2])) : files[0];
+    if (!instance || !file) throw new Error("no such instance or version");
+
+    const dependencies = await ML.cf.installFile(file, modId, instance, kind);
+    ML.settings.set(`installed:${instanceId}:${modId}`, file.fileName);
+
+    const primary = {
+        project_id: projectId(modId),
+        version_id: versionId(modId, file.id),
+        dependent_on_version_id: null,
+    };
+    return {
+        primary,
+        dependencies: dependencies.map(dep => ({
+            project_id: projectId(dep.modId),
+            version_id: versionId(dep.modId, dep.id),
+            dependent_on_version_id: primary.version_id,
+        })),
+        skipped: [],
+    };
+}
+
+async function projectsFor(args) {
+    const ids = args.ids || [];
+    const theirs = ids.filter(id => !CF_PROJECT.test(id));
+    const [ours, rest] = await Promise.all([
+        Promise.all(ids.filter(id => CF_PROJECT.test(id)).map(id => projectV2(modIdOf(id)))),
+        theirs.length ? ML.invoke("plugin:cache|get_project_many", { ...args, ids: theirs }) : [],
+    ]);
+    return [...(rest || []), ...ours.filter(Boolean)];
+}
+
+async function installPackFromPage(args) {
+    const location = args.location;
+    const modId = modIdOf(location.project_id);
+    const match = CF_VERSION.exec(location.version_id || "");
+    const [info, files] = await Promise.all([ML.cf.info(modId), filesFor(modId)]);
+    const file = files.find(candidate => candidate.id === Number(match?.[2])) || files[0];
+    if (!info || !file) throw new Error("This pack's author has blocked downloads");
+
+    const icon = info.logo?.url
+        ? await ML.backend.get(`/download?url=${encodeURIComponent(info.logo.url)}&name=${encodeURIComponent(`icon-${modId}.png`)}`)
+            .catch(() => null)
+        : null;
+
+    const dropIcon = () => {
+        if (icon?.path) ML.backend.get(`/cleanup?path=${encodeURIComponent(icon.path)}`).catch(() => {});
+    };
+
+    return new Promise((resolve, reject) => {
+        ML.cf.installPackFile(file, info, () => {}, {
+            name: location.title,
+            iconPath: icon?.path,
+            onCreated: created => {
+                dropIcon();
+                resolve(created);
+            },
+        }).then(result => {
+            ML.notify(result.blocked
+                ? `${info.name} installed, ${result.blocked} file(s) blocked by their authors`
+                : `${info.name} installed`);
+        }).catch(error => {
+            dropIcon();
+            reject(error);
+            ML.notify(`${info.name}: ${error.message}`);
+        });
+    });
+}
+
+const HANDLERS = {
+    "plugin:cache|get_project_v3": args => projectV3(modIdOf(args.id)),
+    "plugin:cache|get_project": args => projectV2(modIdOf(args.id)),
+    "plugin:cache|get_project_many": projectsFor,
+    "plugin:cache|get_team": args => teamFor(teamModIdOf(args.id)),
+    "plugin:cache|get_organization": () => null,
+    "plugin:cache|get_version_many": versionsFor,
+    "plugin:instance|instance_install_project_with_dependencies": installFromPage,
+    "plugin:install|install_create_modpack_instance": installPackFromPage,
+    "plugin:http|fetch": startApiRequest,
+    "plugin:http|fetch_send": sendApiRequest,
+    "plugin:http|fetch_read_body": readApiBody,
+    "plugin:http|fetch_cancel": cancelApi,
+    "plugin:http|fetch_cancel_body": cancelApi,
+};
+
+function isOurs(command, args) {
+    if (command === "plugin:http|fetch") return CF_API.test(args.clientConfig?.url || "");
+    if (command.startsWith("plugin:http|")) return apiRequests.has(args.rid) || apiBodies.has(args.rid);
+    if (command === "plugin:instance|instance_install_project_with_dependencies") {
+        return CF_PROJECT.test(args.request?.project_id || "");
+    }
+    if (command === "plugin:install|install_create_modpack_instance") {
+        return args.location?.type === "fromVersionId" && CF_PROJECT.test(args.location.project_id || "");
+    }
+    if (command === "plugin:cache|get_project_many") return (args.ids || []).some(id => CF_PROJECT.test(id));
+    if (command === "plugin:cache|get_version_many") return (args.ids || []).some(id => CF_VERSION.test(id));
+    if (command === "plugin:cache|get_team" || command === "plugin:cache|get_organization") {
+        return CF_TEAM.test(args.id || "");
+    }
+    return CF_PROJECT.test(args.id || "");
+}
+
+const MODRINTH_LINK = /^https:\/\/modrinth\.com\/[a-z]+\/cf(\d+)(?:\/version\/cfv\d+x(\d+))?/;
+
+async function curseForgeUrl(url) {
+    const match = MODRINTH_LINK.exec(url || "");
+    if (!match) return null;
+    const site = (await ML.cf.info(Number(match[1])))?.links?.websiteUrl;
+    if (!site) return null;
+    return match[2] ? `${site}/files/${match[2]}` : site;
+}
+
+const REWRITES = {
+    "plugin:opener|open_url": async args => {
+        const url = await curseForgeUrl(args.url);
+        return url ? { ...args, url } : null;
+    },
+};
+
+const CF_API = /^https:\/\/api\.modrinth\.com\/v\d\/(?:[a-z]+\/)?(?:user|project|version)\/cf/;
+const apiRequests = new Map();
+const apiBodies = new Map();
+let nextRid = 2 ** 40;
+
+async function apiAnswer(path) {
+    const user = /^user\/(cf[au]\d+)$/.exec(path);
+    if (user) {
+        if (!authors.has(user[1]) && user[1].startsWith("cfa")) {
+            rememberAuthors(await ML.cf.info(Number(user[1].slice(3))));
+        }
+        const known = authors.get(user[1]);
+        if (!known) return null;
+        const avatar = known.author.avatarUrl || "";
+        return {
+            id: user[1],
+            username: known.author.name,
+            avatar_url: avatar,
+            raw_avatar_url: avatar,
+            bio: null,
+            created: known.created,
+            role: "developer",
+            badges: 0,
+        };
+    }
+    if (/^project\/cf\d+\/disclosures$/.test(path)) return { disclosures: [] };
+    return null;
+}
+
+function startApiRequest(args) {
+    const url = args.clientConfig.url;
+    const rid = nextRid++;
+    const path = url.replace(/^https:\/\/api\.modrinth\.com\/v\d\//, "").split("?")[0];
+    apiRequests.set(rid, { url, answer: apiAnswer(path).catch(() => null) });
+    return rid;
+}
+
+async function sendApiRequest(args) {
+    const request = apiRequests.get(args.rid);
+    apiRequests.delete(args.rid);
+    const data = await request.answer;
+    const body = data === null ? { error: "not_found", description: "the requested route does not exist" } : data;
+    const rid = nextRid++;
+    apiBodies.set(rid, new TextEncoder().encode(JSON.stringify(body)));
+    return {
+        status: data === null ? 404 : 200,
+        statusText: data === null ? "Not Found" : "OK",
+        url: request.url,
+        headers: [["content-type", "application/json"]],
+        rid,
+    };
+}
+
+function readApiBody(args) {
+    const bytes = apiBodies.get(args.rid);
+    if (bytes === null) {
+        apiBodies.delete(args.rid);
+        return new Uint8Array([1]);
+    }
+    apiBodies.set(args.rid, null);
+    const chunk = new Uint8Array(bytes.length + 1);
+    chunk.set(bytes);
+    return chunk;
+}
+
+function cancelApi(args) {
+    apiRequests.delete(args.rid);
+    apiBodies.delete(args.rid);
+    return null;
+}
+
+const fail = message => new Response(JSON.stringify({ field_name: "Ven", message }), {
+    status: 200,
+    headers: { "content-type": "application/json", "tauri-response": "error" },
+});
+
+const reply = data => data instanceof Uint8Array
+    ? new Response(data, {
+        status: 200,
+        headers: { "content-type": "application/octet-stream", "tauri-response": "ok" },
+    })
+    : new Response(JSON.stringify(data), {
+        status: 200,
+        headers: { "content-type": "application/json", "tauri-response": "ok" },
+    });
+
+function hookFetch() {
+    if (window.__venFetch) return;
+    const original = window.fetch;
+    window.__venFetch = original;
+
+    const hooked = async (input, init) => {
+        const url = String(input?.url || input);
+        if (!url.includes("ipc.localhost")) return original(input, init);
+
+        const command = decodeURIComponent(url.slice(url.lastIndexOf("/") + 1));
+        const handler = HANDLERS[command];
+        const rewrite = REWRITES[command];
+        if ((!handler && !rewrite) || typeof init?.body !== "string") return original(input, init);
+
+        let args;
+        try {
+            args = JSON.parse(init.body);
+        } catch {
+            return original(input, init);
+        }
+
+        if (rewrite) {
+            const changed = await rewrite(args).catch(() => null);
+            return original(input, changed ? { ...init, body: JSON.stringify(changed) } : init);
+        }
+        if (!isOurs(command, args)) return original(input, init);
+
+        try {
+            return reply(await handler(args));
+        } catch (e) {
+            console.error("[ML] project data failed:", e);
+            return fail(e?.message || String(e));
+        }
+    };
+    window.fetch = hooked;
+
+    ML.cleanups.push(() => {
+        if (window.fetch === hooked) window.fetch = original;
+        delete window.__venFetch;
+    });
+}
+
+hookFetch();
+
+const appRouter = () => document.querySelector("#app")?.__vue_app__?.config?.globalProperties?.$router;
+
+function waitFor(check, timeout = 5000) {
+    return new Promise(resolve => {
+        const started = Date.now();
+        const tick = () => {
+            const found = check();
+            if (found || Date.now() - started > timeout) return resolve(found || null);
+            setTimeout(tick, 100);
+        };
+        tick();
+    });
+}
+
+async function fillChangelog(to) {
+    if (!/^\/project\/cf\d+\/version\/cfv/.test(to.path)) return;
+    const page = await waitFor(() => ML.findComponent(component =>
+        component.type.__name === "VersionPage" && CF_VERSION.test(component.props.version?.id || "")));
+    const version = page?.props.version;
+    const match = CF_VERSION.exec(version?.id || "");
+    if (!match || version.changelog) return;
+
+    const data = await ML.cf.get(`/v1/mods/${match[1]}/files/${match[2]}/changelog`).catch(() => null);
+    const markup = ML.cf.decodeChangelog(data?.data || "").trim();
+    if (markup) version.changelog = markup;
+}
+
+function openAuthor(to, from) {
+    const match = /^\/user\/([^/]+)/.exec(to.path);
+    if (!match || !/^\/project\/cf\d+/.test(from.path)) return true;
+
+    const name = decodeURIComponent(match[1]);
+    const known = authors.get(name) || [...authors.values()].find(entry => entry.author.name === name);
+    if (!known) return true;
+    if (known.author.url) ML.invoke("plugin:opener|open_url", { url: known.author.url });
+    return false;
+}
+
+function hookRouter() {
+    const router = appRouter();
+    if (!router) return false;
+    const removers = [router.beforeEach(openAuthor), router.afterEach(fillChangelog)];
+    ML.cleanups.push(() => removers.forEach(remove => remove()));
+    fillChangelog(router.currentRoute.value);
+    return true;
+}
+
+if (!hookRouter()) {
+    const timer = setInterval(() => { if (hookRouter()) clearInterval(timer); }, 200);
+    setTimeout(() => clearInterval(timer), 60000);
+    ML.cleanups.push(() => clearInterval(timer));
+}
+
+ML.project = {
+    path: modId => `/project/${projectId(modId)}`,
+    open(modId) {
+        const router = appRouter();
+        if (router) router.push(this.path(modId));
+        else location.assign(this.path(modId));
+    },
+};
