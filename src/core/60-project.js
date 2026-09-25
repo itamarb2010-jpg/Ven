@@ -9,8 +9,6 @@ const teamId = modId => `cft${modId}`;
 const modIdOf = id => Number(CF_PROJECT.exec(id || "")?.[1]) || null;
 const teamModIdOf = id => Number(CF_TEAM.exec(id || "")?.[1]) || null;
 
-
-
 const LINK_FIELDS = { websiteUrl: "website", issuesUrl: "issues", sourceUrl: "source", wikiUrl: "wiki" };
 
 const fileCache = new Map();
@@ -27,7 +25,7 @@ const descriptions = new Map();
 function descriptionFor(modId) {
     if (!descriptions.has(modId)) {
         descriptions.set(modId, ML.cf.get(`/v1/mods/${modId}/description`)
-            .then(data => ML.cf.decodeChangelog(data.data || ""))
+            .then(data => ML.cf.cleanHtml(data.data || ""))
             .catch(() => ""));
     }
     return descriptions.get(modId);
@@ -241,7 +239,6 @@ async function teamFor(modId) {
         ordering: index,
     }));
 }
-
 
 async function installFromPage(args) {
     const { instanceId, request } = args;
@@ -526,7 +523,7 @@ async function fillChangelog(to) {
     if (!match || version.changelog) return;
 
     const data = await ML.cf.get(`/v1/mods/${match[1]}/files/${match[2]}/changelog`).catch(() => null);
-    const markup = ML.cf.decodeChangelog(data?.data || "").trim();
+    const markup = ML.cf.cleanHtml(data?.data || "").trim();
     if (markup) version.changelog = markup;
 }
 

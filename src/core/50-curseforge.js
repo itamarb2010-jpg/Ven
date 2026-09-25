@@ -1,5 +1,6 @@
 const GAME_MINECRAFT = 432;
 const LOADER_IDS = { forge: 1, fabric: 4, quilt: 5, neoforge: 6 };
+const LOADER_LABELS = { forge: "Forge", fabric: "Fabric", quilt: "Quilt", neoforge: "NeoForge" };
 
 const KINDS = [
     { classId: 6, projectType: "mod", page: "/browse/mod", folder: "mods", loaders: true },
@@ -79,7 +80,7 @@ let lastSignature = null;
 let lastPath = location.pathname;
 const listeners = new AbortController();
 
-const cfGet = path => ML.backend.get(`/cf${path}`, { "x-cf-key": ML.settings.get("apiKey") || "" });
+const cfGet = path => ML.backend.get(`/cf${path}`);
 
 async function currentInstance() {
     const id = new URLSearchParams(location.search).get("i");
@@ -373,9 +374,14 @@ async function allFilesFor(modId) {
     return data.data || [];
 }
 
+function checksum(file) {
+    const hash = (file.hashes || []).find(h => h.algo === 1) || (file.hashes || []).find(h => h.algo === 2);
+    return hash ? `&${hash.algo === 1 ? "sha1" : "md5"}=${encodeURIComponent(hash.value)}` : "";
+}
+
 async function placeFile(file, instance, kind) {
     const saved = await ML.backend.get(
-        `/download?url=${encodeURIComponent(file.downloadUrl)}&name=${encodeURIComponent(file.fileName)}`);
+        `/download?url=${encodeURIComponent(file.downloadUrl)}&name=${encodeURIComponent(file.fileName)}${checksum(file)}`);
 
     const add = projectType => ML.invoke("plugin:instance|instance_add_project_from_path", {
         instanceId: instance.id,
@@ -509,7 +515,7 @@ const openInstance = instance => document.querySelector("#app").__vue_app__.conf
 
 async function openInstallModal(mod, kind) {
     const dialog = findMountedComponent("ContentInstallModal");
-    if (!dialog?.exposed?.show) return;
+    if (!dialog?.exposed?.show) return openFallbackInstallModal(mod, kind);
 
     const originalProps = {};
     for (const key of DIALOG_PROPS) originalProps[key] = dialog.props[key];
@@ -624,6 +630,340 @@ async function openInstallModal(mod, kind) {
     dialog.exposed.show();
 }
 
+async function openFallbackInstallModal(mod, kind) {
+    document.getElementById("ven-install-modal")?.remove();
+    ML.ui.ensureStyle();
+
+    const root = document.createElement("div");
+    root.id = "ven-install-modal";
+    root.style.cssText = "position:fixed;inset:0;z-index:1100;display:flex;align-items:center;justify-content:center;";
+    root.innerHTML = `
+      <div class="ven-overlay" style="position:absolute;inset:0;background:rgba(0,0,0,.55);"></div>
+      <div class="modal-body flex flex-col bg-bg-raised rounded-2xl border border-solid border-surface-5 outline-none"
+           style="position:relative;width:560px;max-width:92vw;max-height:95vh;">
+        <div class="grid grid-cols-[1fr_auto] items-center gap-4 p-6 border-solid border-0 border-b-[1px] border-surface-5 max-w-full">
+          <div class="flex text-wrap break-words items-center gap-3 min-w-0">
+            <span class="text-2xl font-semibold text-contrast">Install project</span>
+          </div>
+          <div class="flex items-center gap-2">
+            <button class="VEN_CLOSE_CLASSES" aria-label="Close">VEN_CLOSE_ICON</button>
+          </div>
+        </div>
+
+        <div class="relative flex-1 min-h-0 flex flex-col">
+          <div class="flex-1 min-h-0 overflow-y-auto" style="max-height:70vh;">
+            <div class="${INSTALL_MODAL.section}">
+              <span class="${INSTALL_MODAL.label}">Instance type</span>
+              <div class="ven-chips chips" role="radiogroup"></div>
+            </div>
+            <div class="${INSTALL_MODAL.divider}" style="background:var(--color-divider);"></div>
+            <div class="ven-body"></div>
+          </div>
+        </div>
+
+        <div class="p-4"><div class="ven-footer"></div></div>
+      </div>`
+        .replace("VEN_CLOSE_CLASSES", CLOSE_BUTTON_CLASSES)
+        .replace("VEN_CLOSE_ICON", CLOSE_ICON);
+
+    const close = () => root.remove();
+    root.querySelector(".ven-overlay").addEventListener("click", close);
+    root.querySelector("button[aria-label=Close]").addEventListener("click", close);
+    document.body.appendChild(root);
+
+    const chips = withScope(root.querySelector(".ven-chips"), ".chips");
+    const body = root.querySelector(".ven-body");
+    const footer = root.querySelector(".ven-footer");
+
+    body.appendChild(text("div", INSTALL_MODAL.empty, "Loading..."));
+
+    const instances = await ML.invoke("plugin:instance|instance_list");
+    const files = await allFilesFor(mod.id);
+
+    const loaders = [...new Set(files.flatMap(file =>
+        (file.gameVersions || []).map(v => v.toLowerCase()).filter(v => LOADER_IDS[v])))];
+    const gameVersions = [...new Set(files.flatMap(file =>
+        (file.gameVersions || []).filter(v => /^\d/.test(v))))];
+
+    const entries = [];
+    for (const instance of instances) {
+        const compatible = !!pickFile(await filesFor(mod.id, instance, kind));
+        const installed = !!ML.settings.get(installKey(instance, mod));
+        entries.push({ instance, compatible, installed });
+    }
+    const compatibleCount = entries.filter(e => e.compatible).length;
+
+    let mode = "existing";
+    let query = "";
+    let hideUnavailable = false;
+    let newName = `New instance (${instances.length + 1})`;
+    let newLoader = loaders[0] || null;
+    let newVersion = gameVersions[0] || null;
+
+    const rank = entry => entry.compatible ? (entry.installed ? 1 : 0) : 2;
+
+    const renderFooter = () => {
+        footer.replaceChildren();
+        if (mode === "existing") {
+            footer.className = `ven-footer ${INSTALL_MODAL.footerExisting}`;
+            const note = document.createElement("span");
+            note.className = INSTALL_MODAL.footerNote;
+            note.append(iconSpan(BOX_ICON), text("span", "",
+                `${compatibleCount} compatible instance${compatibleCount === 1 ? "" : "s"}`));
+            const cancel = modalButton("Cancel", INSTALL_MODAL.outlined, CLOSE_ICON);
+            cancel.addEventListener("click", close);
+            footer.append(note, cancel);
+            return;
+        }
+
+        footer.className = `ven-footer ${INSTALL_MODAL.footerNew}`;
+        const cancel = modalButton("Cancel", INSTALL_MODAL.outlined, CLOSE_ICON);
+        cancel.addEventListener("click", close);
+
+        const install = modalButton("Install", INSTALL_MODAL.colored, DOWNLOAD_ICON);
+        install.style.setProperty("--button-color", "var(--color-brand)");
+        install.disabled = !newName || !newLoader || !newVersion;
+        install.addEventListener("click", async () => {
+            install.disabled = true;
+            const report = message => ML.setButtonLabel(install, message);
+            try {
+                report("Creating...");
+                const created = await ML.invoke("plugin:install|install_create_instance", {
+                    request: { name: newName, gameVersion: newVersion, loader: newLoader },
+                });
+                const instanceId = created.instance_id || created.instanceId;
+                await waitForInstance(instanceId, report);
+
+                report("Installing...");
+                const target = { id: instanceId, game_version: newVersion, loader: newLoader };
+                const fileName = await installMod(mod, target, report);
+                ML.settings.set(installKey(target, mod), fileName);
+                ML.notify(`${mod.name} installed to ${newName}`);
+                ML.refresh();
+                close();
+            } catch (e) {
+                report(e.message.slice(0, 26));
+                setTimeout(() => ML.resetButton(install, "Install"), 4000);
+            }
+        });
+
+        footer.append(cancel, install);
+    };
+
+    const renderExisting = () => {
+        body.replaceChildren();
+
+        const wrap = document.createElement("div");
+        wrap.className = INSTALL_MODAL.existingWrap;
+        wrap.style.cssText = INSTALL_MODAL.existingStyle;
+
+        const searchRow = document.createElement("div");
+        searchRow.className = INSTALL_MODAL.searchRow;
+
+        const searchBox = document.createElement("div");
+        searchBox.className = INSTALL_MODAL.searchBox;
+        const glyph = document.createElement("span");
+        glyph.className = "flex size-5 shrink-0 items-center justify-center text-secondary opacity-60 [&>svg]:size-5";
+        glyph.innerHTML = SEARCH_ICON;
+        const input = document.createElement("input");
+        input.className = INSTALL_MODAL.searchInput;
+        input.placeholder = "Search instance";
+        input.value = query;
+        input.addEventListener("input", () => { query = input.value.trim(); renderRows(); });
+        searchBox.append(glyph, input);
+
+        const eyeLabel = hideUnavailable ? "Show unavailable" : "Hide unavailable";
+        const eye = modalButton("", `${INSTALL_MODAL.outlined} w-9 !px-0 !rounded-full`, hideUnavailable ? EYE_OFF_ICON : EYE_ICON);
+        eye.setAttribute("aria-label", eyeLabel);
+        eye.title = eyeLabel;
+        eye.addEventListener("click", () => { hideUnavailable = !hideUnavailable; renderExisting(); });
+
+        searchRow.append(searchBox, eye);
+
+        const list = document.createElement("div");
+        list.className = INSTALL_MODAL.list;
+
+        const renderRows = () => {
+            list.replaceChildren();
+
+            let shown = entries;
+            if (hideUnavailable) shown = shown.filter(e => e.compatible && !e.installed);
+            if (query) {
+                const needle = query.toLowerCase();
+                shown = shown.filter(e => e.instance.name.toLowerCase().includes(needle));
+            }
+            shown = shown.slice().sort((a, b) =>
+                rank(a) - rank(b) || a.instance.name.localeCompare(b.instance.name));
+
+            if (!shown.length) {
+                list.appendChild(text("div", INSTALL_MODAL.empty, "No compatible instances found"));
+                return;
+            }
+
+            for (const entry of shown) {
+                const row = document.createElement("div");
+                row.className = `${INSTALL_MODAL.row} ${entry.installed ? "opacity-60" : "hover:bg-surface-3"}`;
+
+                const left = document.createElement("button");
+                left.type = "button";
+                left.className = INSTALL_MODAL.rowButton;
+                if (!entry.compatible) left.title = INCOMPATIBLE_TOOLTIP;
+                const icon = instanceIconUrl(entry.instance);
+                if (icon) {
+                    const image = withScope(document.createElement("img"), ".avatar");
+                    image.src = icon;
+                    image.alt = "";
+                    image.className = "avatar shrink-0";
+                    image.setAttribute("rounded", "md");
+                    image.style.setProperty("--_size", "2rem");
+                    left.appendChild(image);
+                }
+                left.appendChild(text("span", INSTALL_MODAL.rowName, entry.instance.name));
+                left.addEventListener("click", () => {
+                    close();
+                    openInstance(entry.instance);
+                });
+                row.appendChild(left);
+
+                if (entry.installed) {
+                    const badge = modalButton("Installed", INSTALL_MODAL.base, CHECK_ICON);
+                    badge.disabled = true;
+                    badge.setAttribute("aria-disabled", "true");
+                    row.appendChild(badge);
+                } else {
+                    const action = entry.compatible
+                        ? modalButton("Install", INSTALL_MODAL.base, null)
+                        : modalButton("Install", `${INSTALL_MODAL.outlined} ${INSTALL_MODAL.warning}`, WARN_ICON);
+                    if (!entry.compatible) action.title = INCOMPATIBLE_TOOLTIP;
+
+                    action.addEventListener("click", async () => {
+                        action.disabled = true;
+                        const report = message => ML.setButtonLabel(action, message);
+                        report("Installing...");
+                        try {
+                            const fileName = await installMod(mod, entry.instance, report, !entry.compatible);
+                            ML.settings.set(installKey(entry.instance, mod), fileName);
+                            entry.installed = true;
+                            ML.markButtonDone(action, "Installed");
+                            ML.notify(`${mod.name} installed to ${entry.instance.name}`);
+                            ML.refresh();
+                        } catch (e) {
+                            report(e.message.slice(0, 26));
+                            setTimeout(() => ML.resetButton(action, "Install"), 4000);
+                        }
+                    });
+                    row.appendChild(action);
+                }
+
+                list.appendChild(row);
+            }
+        };
+
+        wrap.append(searchRow, list);
+        body.appendChild(wrap);
+        renderRows();
+    };
+
+    const isRelease = version => /^\d+\.\d+(\.\d+)?$/.test(version);
+    const releaseVersions = gameVersions.filter(isRelease);
+    let showAllVersions = releaseVersions.length === 0;
+
+    const renderNew = () => {
+        body.replaceChildren();
+
+        const wrap = document.createElement("div");
+        wrap.className = INSTALL_MODAL.newWrap;
+
+        const nameField = document.createElement("div");
+        nameField.className = INSTALL_MODAL.field;
+        nameField.appendChild(text("span", INSTALL_MODAL.label, "Name"));
+        const nameBox = document.createElement("div");
+        nameBox.className = INSTALL_MODAL.inputBox;
+        const nameInput = document.createElement("input");
+        nameInput.className = INSTALL_MODAL.searchInput;
+        nameInput.placeholder = "Enter instance name";
+        nameInput.value = newName;
+        nameInput.addEventListener("input", () => { newName = nameInput.value.trim(); renderFooter(); });
+        nameBox.appendChild(nameInput);
+        nameField.appendChild(nameBox);
+        wrap.appendChild(nameField);
+
+        const loaderField = document.createElement("div");
+        loaderField.className = INSTALL_MODAL.field;
+        loaderField.appendChild(text("span", INSTALL_MODAL.label, "Loader"));
+        const loaderChips = withScope(document.createElement("div"), ".chips");
+        loaderChips.className = "chips";
+        loaderChips.setAttribute("role", "radiogroup");
+        for (const loader of loaders) {
+            const active = loader === newLoader;
+            const chip = chipButton(LOADER_LABELS[loader] || loader, active);
+            chip.classList.add("capitalize");
+            chip.addEventListener("click", () => { newLoader = loader; renderNew(); renderFooter(); });
+            loaderChips.appendChild(chip);
+        }
+        loaderField.appendChild(loaderChips);
+        wrap.appendChild(loaderField);
+
+        const versionField = document.createElement("div");
+        versionField.className = INSTALL_MODAL.field;
+        versionField.appendChild(text("span", INSTALL_MODAL.label, "Game version"));
+
+        const options = showAllVersions ? gameVersions : releaseVersions;
+        if (!options.includes(newVersion)) newVersion = options[0] || null;
+
+        const versionBox = document.createElement("div");
+        versionBox.className = `${INSTALL_MODAL.inputBox} w-full`;
+        const select = document.createElement("select");
+        select.className = `${INSTALL_MODAL.searchInput} cursor-pointer`;
+        for (const option of options) {
+            const item = document.createElement("option");
+            item.value = option;
+            item.textContent = option;
+            if (option === newVersion) item.selected = true;
+            select.appendChild(item);
+        }
+        select.addEventListener("change", () => { newVersion = select.value; renderFooter(); });
+        const chevron = document.createElement("span");
+        chevron.className = "flex shrink-0 items-center gap-2";
+        chevron.innerHTML = SELECT_CHEVRON;
+        versionBox.append(select, chevron);
+        versionField.appendChild(versionBox);
+
+        if (releaseVersions.length) {
+            const toggle = document.createElement("button");
+            toggle.type = "button";
+            toggle.className = "flex w-full cursor-pointer items-center justify-center gap-1.5 border-0 bg-transparent py-2 text-center text-sm font-semibold text-secondary transition-colors hover:text-contrast";
+            toggle.appendChild(iconSpan(showAllVersions ? EYE_OFF_ICON : EYE_ICON));
+            toggle.append(text("span", "", showAllVersions ? "Hide snapshots" : "Show all versions"));
+            toggle.addEventListener("click", () => { showAllVersions = !showAllVersions; renderNew(); renderFooter(); });
+            versionField.appendChild(toggle);
+        }
+
+        wrap.appendChild(versionField);
+        body.appendChild(wrap);
+    };
+
+    const drawChips = () => {
+        const tabs = [["existing", "Existing instance"], ["new", "New instance"]];
+        chips.replaceChildren(...tabs
+            .filter(([id]) => id === "existing" || loaders.length)
+            .map(([id, label]) => {
+                const chip = chipButton(label, mode === id);
+                chip.addEventListener("click", () => {
+                    mode = id;
+                    drawChips();
+                    if (id === "existing") renderExisting(); else renderNew();
+                    renderFooter();
+                });
+                return chip;
+            }));
+    };
+
+    drawChips();
+    renderExisting();
+    renderFooter();
+}
+
 function loaderFromManifest(manifest) {
     const primary = (manifest.minecraft?.modLoaders || [])
         .find(entry => entry.primary) || (manifest.minecraft?.modLoaders || [])[0];
@@ -672,7 +1012,7 @@ async function installPack(mod, report) {
 async function installPackFile(file, mod, report = () => {}, options = {}) {
     report("Downloading pack...");
     const saved = await ML.backend.get(
-        `/download?url=${encodeURIComponent(file.downloadUrl)}&name=${encodeURIComponent(file.fileName)}`);
+        `/download?url=${encodeURIComponent(file.downloadUrl)}&name=${encodeURIComponent(file.fileName)}${checksum(file)}`);
 
     report("Reading pack...");
     const manifest = await ML.backend.get(`/pack/manifest?path=${encodeURIComponent(saved.path)}`);
@@ -772,7 +1112,8 @@ async function runSearch(force = false) {
     if (!force && current === lastSignature) return;
     lastSignature = current;
 
-    if (!ML.settings.get("apiKey")) {
+    await ML.cfKey.ready;
+    if (!ML.cfKey.saved) {
         message(box, "Add your CurseForge API key in Ven Settings.");
         return;
     }
@@ -1041,6 +1382,99 @@ const V = {
     quiet: "button-frame--quiet bg-transparent [&>svg]:text-inherit [&:not(:disabled):not([aria-disabled=true]):hover]:bg-surface-4 [&:not(:disabled):not([aria-disabled=true]):focus-visible]:bg-surface-4",
 };
 
+const INSTALL_MODAL = {
+    section: "flex flex-col gap-2.5 p-6",
+    label: "font-semibold text-contrast",
+    divider: "h-px bg-divider",
+    empty: "flex items-center justify-center py-12 text-secondary",
+    existingWrap: "flex flex-col gap-3 bg-surface-2 py-4",
+    existingStyle: "height:400px;overflow-y:auto;",
+    searchRow: "flex items-start gap-3 px-6",
+    inputBox: "group/input min-w-0 touch-manipulation border border-solid font-medium text-primary shadow-none transition-[background-color,border-color,box-shadow,color] focus-within:text-contrast focus-within:ring-4 focus-within:ring-brand-shadow inline-flex h-9 items-center gap-2 rounded-xl px-3 border-surface-5 bg-surface-4",
+    searchBox: "flex-1 group/input min-w-0 touch-manipulation border border-solid font-medium text-primary shadow-none transition-[background-color,border-color,box-shadow,color] focus-within:text-contrast focus-within:ring-4 focus-within:ring-brand-shadow inline-flex h-9 items-center gap-2 rounded-xl px-3 border-surface-5 bg-surface-4",
+    searchInput: "min-w-0 w-full flex-1 appearance-none !min-h-0 !border-0 !bg-transparent !p-0 font-medium text-primary !shadow-none !outline-none placeholder:text-secondary focus:text-contrast focus:ring-0 text-base",
+    list: "flex flex-col gap-1",
+    row: "flex items-center justify-between px-6 py-1.5",
+    rowButton: "flex min-w-0 cursor-pointer items-center gap-2.5 overflow-hidden border-0 bg-transparent p-0 text-left",
+    rowName: "truncate font-semibold text-contrast hover:underline",
+    base: "button-frame--base bg-surface-4 text-contrast [&>svg]:text-primary",
+    outlined: V.outlined,
+    colored: V.colored,
+    warning: "!text-orange [&>svg]:!text-orange !shadow-[inset_0_0_0_1px_var(--color-orange)]",
+    chip: "button-frame--base bg-surface-4 text-contrast [&>svg]:text-primary btn !brightness-100 hover:!brightness-125",
+    chipSelected: "button-frame--base bg-surface-4 text-contrast [&>svg]:text-primary btn !brightness-100 hover:!brightness-125 selected",
+    newWrap: "flex flex-col gap-6 p-6",
+    field: "flex flex-col gap-2.5",
+    footerExisting: "flex items-center justify-between pt-5 pb-1 px-4",
+    footerNote: "flex items-center gap-1.5",
+    footerNew: "flex items-center justify-end gap-2",
+};
+
+const INCOMPATIBLE_TOOLTIP = "This instance uses a different loader or game version than this project supports.";
+
+const CHECK_ICON = `<svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></svg>`;
+
+const SELECTED_ICON = `<svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" viewBox="0 0 24 24" class="!text-brand" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>`;
+
+const SEARCH_ICON = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" fill="none" viewBox="0 0 24 24"><path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="m21 21-6-6m2-5a7 7 0 1 1-14 0 7 7 0 0 1 14 0"/></svg>`;
+
+const EYE_OFF_ICON = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" viewBox="0 0 24 24"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9 9 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24M1 1l22 22"/></svg>`;
+
+const SELECT_CHEVRON = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" viewBox="0 0 24 24" class="pointer-events-none size-5 text-secondary transition-transform duration-150 -rotate-90"><path d="m15 18-6-6 6-6"/></svg>`;
+
+const BOX_ICON = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" viewBox="0 0 24 24" class="size-5"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16"/><path d="M3.29 7 12 12l8.71-5M12 22V12"/></svg>`;
+
+const instanceIconUrl = instance => instance.icon_path
+    ? `http://asset.localhost/${encodeURIComponent(instance.icon_path)}`
+    : null;
+
+const cssScopes = new Map();
+
+function withScope(element, selector) {
+    if (!cssScopes.has(selector)) {
+        let scope = null;
+        for (const sheet of document.styleSheets) {
+            let rules;
+            try {
+                rules = sheet.cssRules;
+            } catch {
+                continue;
+            }
+            const rule = [...rules].find(candidate => candidate.selectorText?.startsWith(`${selector}[data-v-`));
+            if (rule) {
+                scope = rule.selectorText.match(/\[(data-v-[0-9a-f]+)\]/)[1];
+                break;
+            }
+        }
+        cssScopes.set(selector, scope);
+    }
+    const scope = cssScopes.get(selector);
+    if (scope) element.setAttribute(scope, "");
+    return element;
+}
+
+function modalButton(label, classes, svg) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `${V.button} ${classes}`;
+    applyButtonScope(button);
+    if (svg) button.insertAdjacentHTML("beforeend", svg);
+    if (label) button.append(` ${label}`);
+    return button;
+}
+
+function chipButton(label, selected) {
+    const chip = withScope(document.createElement("button"), ".chips");
+    chip.type = "button";
+    chip.className = `${V.button} ${selected ? INSTALL_MODAL.chipSelected : INSTALL_MODAL.chip}`;
+    applyButtonScope(chip);
+    chip.setAttribute("role", "radio");
+    chip.setAttribute("aria-checked", String(selected));
+    if (selected) chip.insertAdjacentHTML("beforeend", SELECTED_ICON);
+    chip.append(text("span", "", label));
+    return chip;
+}
+
 const RELEASE_TINT = { 2: "#e5a13a", 3: "#e65a5a" };
 const RELEASE_NAME = { 1: "Release", 2: "Beta", 3: "Alpha" };
 const releaseName = file => RELEASE_NAME[file.releaseType] || "Release";
@@ -1091,20 +1525,27 @@ function decodeChangelog(html) {
     return decoder.value;
 }
 
-function safeChangelog(html) {
-    const markup = decodeChangelog(html);
+const EMBEDS = [
+    /^https?:\/\/(www\.)?youtube(-nocookie)?\.com\/embed\/[a-zA-Z0-9_-]{11}/,
+    /^https?:\/\/(www\.)?discord\.com\/widget/,
+];
 
+ML.purify.addHook("afterSanitizeAttributes", node => {
+    if (node.nodeName === "IFRAME" && !EMBEDS.some(embed => embed.test(node.getAttribute("src") || ""))) {
+        node.removeAttribute("src");
+    }
+});
+
+const cleanHtml = html => ML.purify.sanitize(decodeChangelog(html), {
+    ADD_TAGS: ["iframe"],
+    ADD_ATTR: ["target", "allowfullscreen", "frameborder", "start", "end"],
+});
+
+function safeChangelog(html) {
     const holder = document.createElement("div");
-    holder.innerHTML = markup;
-    holder.querySelectorAll("script, style, iframe, object, embed").forEach(el => el.remove());
-    holder.querySelectorAll("*").forEach(el => {
-        for (const attribute of [...el.attributes]) {
-            if (/^on/i.test(attribute.name)) el.removeAttribute(attribute.name);
-            const url = attribute.value.replace(/[\u0000-\u0020]/g, "");
-            if (attribute.name.endsWith("href") && /^javascript:/i.test(url)) {
-                el.removeAttribute(attribute.name);
-            }
-        }
+    holder.innerHTML = ML.purify.sanitize(decodeChangelog(html), {
+        FORBID_TAGS: ["style"],
+        ADD_ATTR: ["target"],
     });
     return holder;
 }
@@ -1431,7 +1872,7 @@ async function openVersionPicker(instance, kind, entry, info) {
         let markup = "";
         try {
             const data = await cfGet(`/v1/mods/${entry.modId}/files/${version.id}/changelog`);
-            markup = decodeChangelog(data.data || "").trim();
+            markup = cleanHtml(data.data || "").trim();
         } catch {
             markup = "";
         }
@@ -1606,7 +2047,7 @@ ML.cf = {
     info: modInfo,
     files: allFilesFor,
     versionLabel,
-    decodeChangelog,
+    cleanHtml,
     installFile,
     installPackFile,
     releaseName,

@@ -4,12 +4,12 @@ use std::path::{Component, Path, PathBuf};
 
 const OVERRIDE_DIRS: [&str; 2] = ["overrides", "client-overrides"];
 
-fn open(path: &str) -> Result<zip::ZipArchive<File>, String> {
+fn open(path: &Path) -> Result<zip::ZipArchive<File>, String> {
     let file = File::open(path).map_err(|e| format!("could not open pack: {e}"))?;
     zip::ZipArchive::new(file).map_err(|e| format!("not a readable zip: {e}"))
 }
 
-pub fn manifest(path: &str) -> Result<String, String> {
+pub fn manifest(path: &Path) -> Result<String, String> {
     let mut archive = open(path)?;
     let mut entry = archive
         .by_name("manifest.json")
@@ -33,8 +33,7 @@ fn safe_join(dest: &Path, relative: &str) -> Option<PathBuf> {
     Some(out)
 }
 
-pub fn extract_overrides(path: &str, dest: &str) -> Result<usize, String> {
-    let destination = Path::new(dest);
+pub fn extract_overrides(path: &Path, destination: &Path) -> Result<usize, String> {
     if !destination.is_dir() {
         return Err("destination folder does not exist".into());
     }

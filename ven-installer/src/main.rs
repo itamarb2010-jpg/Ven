@@ -1,7 +1,7 @@
 #![windows_subsystem = "windows"]
 
 use std::os::windows::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const SHIM: &[u8] = include_bytes!("../../ven-shim/target/release/Ven.exe");
@@ -38,12 +38,15 @@ fn shortcuts() -> Vec<PathBuf> {
     found
 }
 
-fn powershell(script: &str) -> Result<(), String> {
-    let out = Command::new("powershell")
+fn powershell(script: &str, vars: &[(&str, &Path)]) -> Result<(), String> {
+    let mut command = Command::new("powershell");
+    command
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map_err(|e| e.to_string())?;
+        .creation_flags(CREATE_NO_WINDOW);
+    for (name, value) in vars {
+        command.env(name, value);
+    }
+    let out = command.output().map_err(|e| e.to_string())?;
     if out.status.success() {
         Ok(())
     } else {
@@ -52,14 +55,12 @@ fn powershell(script: &str) -> Result<(), String> {
 }
 
 fn retarget(lnk: &PathBuf, target: &PathBuf, icon: &PathBuf) -> Result<(), String> {
-    powershell(&format!(
-        r#"$s=(New-Object -ComObject WScript.Shell).CreateShortcut('{}');
-           $s.TargetPath='{}'; $s.IconLocation='{}'; $s.WorkingDirectory='{}'; $s.Save()"#,
-        lnk.display(),
-        target.display(),
-        icon.display(),
-        target.parent().map(|p| p.display().to_string()).unwrap_or_default(),
-    ))
+    let dir = target.parent().unwrap_or(Path::new(""));
+    powershell(
+        r#"$s=(New-Object -ComObject WScript.Shell).CreateShortcut($env:VEN_LNK);
+           $s.TargetPath=$env:VEN_TARGET; $s.IconLocation=$env:VEN_ICON; $s.WorkingDirectory=$env:VEN_DIR; $s.Save()"#,
+        &[("VEN_LNK", lnk.as_path()), ("VEN_TARGET", target.as_path()), ("VEN_ICON", icon.as_path()), ("VEN_DIR", dir)],
+    )
 }
 
 fn discard(path: &PathBuf) -> Result<(), String> {

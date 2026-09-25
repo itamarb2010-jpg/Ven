@@ -6,5 +6,5 @@ import { buildBundle } from "./bundle.mjs";
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 mkdirSync(join(root, "dist"), { recursive: true });
 const out = join(root, "dist", "bundle.js");
-writeFileSync(out, buildBundle({ embedConfig: false }), "utf8");
+writeFileSync(out, buildBundle(), "utf8");
 console.log("wrote", out);

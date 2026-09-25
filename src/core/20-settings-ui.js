@@ -105,8 +105,12 @@ function apiKeyField() {
     input.className = "ven-input rounded-xl px-3 py-2 text-sm";
     input.style.cssText = "flex:none;width:18rem;";
     input.placeholder = "paste your key";
-    input.value = ML.settings.get("apiKey", "");
-    input.addEventListener("change", () => ML.settings.set("apiKey", input.value.trim()));
+    const masked = () => (ML.cfKey.saved ? "\u2022".repeat(ML.cfKey.length) : "");
+    input.value = masked();
+    input.addEventListener("change", async () => {
+        await ML.cfKey.set(input.value.trim());
+        input.value = masked();
+    });
     row.appendChild(input);
 
     return row;

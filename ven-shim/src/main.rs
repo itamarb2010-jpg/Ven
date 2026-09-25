@@ -1,8 +1,10 @@
 #![windows_subsystem = "windows"]
 
 mod backend;
+mod key;
 mod pack;
 
+use std::collections::HashMap;
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::os::windows::process::CommandExt;
@@ -13,15 +15,17 @@ use std::time::Duration;
 const BUNDLE: &str = include_str!("../../dist/bundle.js");
 const APP_EXE: &str = "Modrinth App.exe";
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const BINDING: &str = "venBackend";
+const APP_ORIGIN: &str = "http://tauri.localhost";
+const FRAME_TREE: u32 = 5;
 
 type Socket = tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>;
 
-fn free_port() -> u16 {
+fn free_port() -> Option<u16> {
     TcpListener::bind("127.0.0.1:0")
         .ok()
         .and_then(|l| l.local_addr().ok())
         .map(|a| a.port())
-        .unwrap_or(9222)
 }
 
 fn app_path() -> Option<PathBuf> {
@@ -66,12 +70,88 @@ fn inject(ws_url: &str, payload: &str) -> Result<Socket, Box<dyn std::error::Err
     };
 
     send(&mut socket, 1, "Page.enable", serde_json::json!({}))?;
-    send(&mut socket, 2, "Page.setBypassCSP", serde_json::json!({ "enabled": true }))?;
-    send(&mut socket, 3, "Page.addScriptToEvaluateOnNewDocument",
+    send(&mut socket, 2, "Runtime.enable", serde_json::json!({}))?;
+    send(&mut socket, 3, "Runtime.addBinding", serde_json::json!({ "name": BINDING }))?;
+    send(&mut socket, 4, "Page.addScriptToEvaluateOnNewDocument",
          serde_json::json!({ "source": payload }))?;
-    send(&mut socket, 4, "Page.reload", serde_json::json!({}))?;
+    send(&mut socket, FRAME_TREE, "Page.getFrameTree", serde_json::json!({}))?;
+    send(&mut socket, 6, "Page.navigate", serde_json::json!({ "url": format!("{APP_ORIGIN}/") }))?;
 
     Ok(socket)
+}
+
+fn serve(mut socket: Socket) {
+    let mut next_id = 100u64;
+    let mut main_frame = serde_json::Value::Null;
+    let mut contexts: HashMap<i64, serde_json::Value> = HashMap::new();
+    loop {
+        let text = match socket.read() {
+            Ok(tungstenite::Message::Text(text)) => text,
+            Ok(_) => continue,
+            Err(_) => return,
+        };
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
+        let params = &event["params"];
+        match event["method"].as_str() {
+            Some("Runtime.executionContextCreated") => {
+                if let Some(id) = params["context"]["id"].as_i64() {
+                    contexts.insert(id, params["context"].clone());
+                }
+                continue;
+            }
+            Some("Runtime.executionContextDestroyed") => {
+                if let Some(id) = params["executionContextId"].as_i64() {
+                    contexts.remove(&id);
+                }
+                continue;
+            }
+            Some("Runtime.executionContextsCleared") => {
+                contexts.clear();
+                continue;
+            }
+            Some("Page.frameNavigated") if params["frame"]["parentId"].is_null() => {
+                main_frame = params["frame"]["id"].clone();
+                continue;
+            }
+            Some("Runtime.bindingCalled") if params["name"] == BINDING => {}
+            _ => {
+                if event["id"] == FRAME_TREE {
+                    main_frame = event["result"]["frameTree"]["frame"]["id"].clone();
+                }
+                continue;
+            }
+        }
+
+        let caller = params["executionContextId"].as_i64().and_then(|id| contexts.get(&id));
+        let trusted = caller.is_some_and(|context| {
+            context["origin"] == APP_ORIGIN
+                && context["auxData"]["isDefault"] == true
+                && !main_frame.is_null()
+                && context["auxData"]["frameId"] == main_frame
+        });
+        if !trusted {
+            continue;
+        }
+
+        let payload = event["params"]["payload"].as_str().unwrap_or_default();
+        let Ok(call) = serde_json::from_str::<serde_json::Value>(payload) else { continue };
+        let Some(id) = call["id"].as_u64() else { continue };
+        let (status, body) = backend::handle(call["path"].as_str().unwrap_or_default(), &call["headers"]);
+
+        let expression = format!(
+            "window.__venBackendReply({id}, {status}, {})",
+            serde_json::Value::String(body)
+        );
+        next_id += 1;
+        let reply = serde_json::json!({
+            "id": next_id,
+            "method": "Runtime.evaluate",
+            "params": { "expression": expression, "contextId": event["params"]["executionContextId"] },
+        });
+        if socket.send(tungstenite::Message::Text(reply.to_string())).is_err() {
+            return;
+        }
+    }
 }
 
 const RELAUNCH_WATCH_SECS: u64 = 25;
@@ -142,7 +222,10 @@ fn wait_until_closed() -> bool {
 }
 
 fn launch_and_inject(exe: &PathBuf, payload: &str) -> Option<(std::process::Child, Socket)> {
-    let port = free_port();
+    let Some(port) = free_port() else {
+        let _ = Command::new(exe).spawn();
+        return None;
+    };
     let child = Command::new(exe)
         .env("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
              format!("--remote-debugging-port={port}"))
@@ -156,24 +239,15 @@ fn launch_and_inject(exe: &PathBuf, payload: &str) -> Option<(std::process::Chil
 fn main() {
     let Some(exe) = app_path() else { return };
 
-    let helper = backend::start();
-
-    let preamble = match &helper {
-        Some(b) => format!(
-            "window.__VEN_BACKEND__ = {{ port: {}, token: \"{}\" }};\n",
-            b.port, b.token
-        ),
-        None => String::new(),
-    };
-    let payload = format!("{preamble}{BUNDLE}");
+    let payload = BUNDLE;
 
     let mut takeovers = 0;
 
     loop {
-        let Some((mut child, socket)) = launch_and_inject(&exe, &payload) else { return };
+        let Some((mut child, socket)) = launch_and_inject(&exe, payload) else { return };
         let child_pid = child.id();
+        std::thread::spawn(move || serve(socket));
         let _ = child.wait();
-        drop(socket);
 
         if takeovers >= MAX_TAKEOVERS {
             return;
