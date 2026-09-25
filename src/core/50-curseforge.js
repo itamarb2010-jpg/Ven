@@ -14,13 +14,10 @@ const currentPageKind = () => KINDS.find(kind => kind.page === location.pathname
 
 const SORT_FIELDS = {
     "relevance": 1,
-    "download count": 6,
     "downloads": 6,
-    "follow count": 2,
-    "follows": 2,
-    "recently published": 3,
-    "recently updated": 3,
-    "newest": 3,
+    "followers": 2,
+    "date published": 11,
+    "date updated": 3,
 };
 
 const DROPDOWN_BUTTON_CLASSES = "relative inline-flex shrink-0 items-center justify-center whitespace-nowrap border-0 no-underline touch-manipulation cursor-pointer select-none transition-[background-color,color,box-shadow,filter,opacity,transform] duration-150 ease-out enabled:active:scale-[0.97] focus-visible:outline-none button-frame--base bg-surface-4 text-contrast [&>svg]:text-primary h-9 gap-1 rounded-xl px-2.5 text-sm font-semibold leading-5 text-left";
@@ -275,9 +272,12 @@ const installKey = (instance, mod) => `installed:${instance.id}:${mod.id}`;
 async function installedFileNames(instance) {
     if (!instance) return null;
     try {
-        const items = await ML.invoke("plugin:instance|instance_get_content_items",
-            { instanceId: instance.id });
-        return new Set(items.map(i => i.file_name).filter(Boolean));
+        const [items, pack] = await Promise.all([
+            ML.invoke("plugin:instance|instance_get_content_items", { instanceId: instance.id }),
+            ML.invoke("plugin:instance|instance_get_linked_modpack_content", { instanceId: instance.id })
+                .catch(() => []),
+        ]);
+        return new Set([...items, ...(pack || [])].map(i => i.file_name).filter(Boolean));
     } catch {
         return null;
     }
@@ -1010,62 +1010,154 @@ async function installPack(mod, report) {
     return installPackFile(file, mod, report);
 }
 
-async function installPackFile(file, mod, report = () => {}, options = {}) {
+const packKey = instanceId => `pack:${instanceId}`;
+const packOf = instanceId => ML.settings.get(packKey(instanceId)) || null;
+const forgetPack = instanceId => ML.settings.set(packKey(instanceId), undefined);
+
+const isContentPath = path => KINDS.some(kind =>
+    kind.folder && path.startsWith(`${kind.folder}/`) && !path.slice(kind.folder.length + 1).includes("/"));
+
+const removeContent = (instanceId, projectPath) =>
+    ML.invoke("plugin:instance|instance_remove_project", { instanceId, projectPath }).catch(() => {});
+
+const setEnabled = (instanceId, projectPath, enabled) =>
+    ML.invoke("plugin:instance|instance_toggle_disable_project", { instanceId, projectPath, desiredEnabled: enabled });
+
+async function readPack(file, report) {
     report("Downloading pack...");
     const saved = await ML.backend.get(
         `/download?url=${encodeURIComponent(file.downloadUrl)}&name=${encodeURIComponent(file.fileName)}${checksum(file)}`);
 
-    report("Reading pack...");
-    const manifest = await ML.backend.get(`/pack/manifest?path=${encodeURIComponent(saved.path)}`);
+    try {
+        report("Reading pack...");
+        const manifest = await ML.backend.get(`/pack/manifest?path=${encodeURIComponent(saved.path)}`);
+        const gameVersion = manifest.minecraft?.version;
+        const loader = loaderFromManifest(manifest);
+        if (!gameVersion || !loader) throw new Error("Unsupported pack manifest");
+        return { saved, manifest, gameVersion, loader };
+    } catch (error) {
+        ML.backend.get(`/cleanup?path=${encodeURIComponent(saved.path)}`).catch(() => {});
+        throw error;
+    }
+}
 
-    const gameVersion = manifest.minecraft?.version;
-    const loader = loaderFromManifest(manifest);
-    if (!gameVersion || !loader) throw new Error("Unsupported pack manifest");
+async function applyPack(pack, instanceId, previous, report, reset = false) {
+    const before = previous?.files || [];
+    const disabled = new Set(previous
+        ? (await ML.invoke("plugin:instance|instance_get_linked_modpack_content", { instanceId }).catch(() => []))
+            .filter(item => item.enabled === false)
+            .map(item => item.file_path.replace(/\.disabled$/, ""))
+        : []);
 
-    report("Creating instance...");
-    const request = { name: options.name || manifest.name || mod.name, gameVersion, loader: loader.loader };
-    if (loader.version) request.loaderVersion = loader.version;
-    if (options.iconPath) request.iconPath = options.iconPath;
-    const created = await ML.invoke("plugin:install|install_create_instance", { request });
-
-    const instanceId = created.instance_id || created.instanceId;
-    if (!instanceId) throw new Error("No instance was created");
-    options.onCreated?.(created);
-
-    await waitForInstance(instanceId, report);
-    const instance = { id: instanceId };
     const fullPath = await ML.invoke("plugin:instance|instance_get_full_path", { instanceId });
-
     report("Unpacking files...");
-    await ML.backend.get(
-        `/pack/overrides?path=${encodeURIComponent(saved.path)}&dest=${encodeURIComponent(fullPath)}`)
-        .catch(() => ({ files: 0 }));
+    const extracted = await ML.backend.get(
+        `/pack/overrides?path=${encodeURIComponent(pack.saved.path)}&dest=${encodeURIComponent(fullPath)}`)
+        .catch(() => ({ paths: [] }));
+    const overrides = (extracted.paths || []).filter(isContentPath);
 
-    const entries = manifest.files || [];
+    const entries = pack.manifest.files || [];
+    const files = [];
     let done = 0;
     let blocked = 0;
 
     await inBatches(entries, 4, async entry => {
+        const old = before.find(item => item.projectID === entry.projectID);
         try {
-            const info = await cfGet(`/v1/mods/${entry.projectID}/files/${entry.fileID}`);
-            const packFile = info.data;
-            if (!packFile?.downloadUrl) {
-                blocked += 1;
+            if (old && old.fileID === entry.fileID && !reset) {
+                files.push(old);
             } else {
+                const packFile = (await cfGet(`/v1/mods/${entry.projectID}/files/${entry.fileID}`)).data;
+                if (!packFile?.downloadUrl) throw new Error("blocked");
+
                 const project = await modInfo(entry.projectID);
                 const kind = KINDS.find(candidate => candidate.folder && candidate.classId === project?.classId) || KINDS[0];
-                await placeFile(packFile, instance, kind);
+                const path = `${kind.folder}/${packFile.fileName}`;
+                const wasDisabled = old && disabled.has(old.path);
+                if (wasDisabled) await setEnabled(instanceId, old.path, true);
+
+                await placeFile(packFile, { id: instanceId }, kind);
+                if (old && old.path !== path) await removeContent(instanceId, old.path);
+                if (wasDisabled && !reset) await setEnabled(instanceId, path, false);
+                files.push({ projectID: entry.projectID, fileID: entry.fileID, path });
             }
         } catch {
             blocked += 1;
+            if (old) files.push(old);
         }
         done += 1;
         report(`${done}/${entries.length}`);
     });
 
-    ML.backend.get(`/cleanup?path=${encodeURIComponent(saved.path)}`).catch(() => {});
-    ML.refresh();
-    return { instanceId, total: entries.length, blocked };
+    const kept = new Set([...files.map(item => item.path), ...overrides]);
+    for (const path of [...before.map(item => item.path), ...(previous?.overrides || [])]) {
+        if (!kept.has(path)) await removeContent(instanceId, path);
+    }
+    return { files, overrides, blocked, total: entries.length };
+}
+
+async function installPackFile(file, mod, report = () => {}, options = {}) {
+    const pack = await readPack(file, report);
+    try {
+        report("Creating instance...");
+        const request = { name: options.name || pack.manifest.name || mod.name, gameVersion: pack.gameVersion, loader: pack.loader.loader };
+        if (pack.loader.version) request.loaderVersion = pack.loader.version;
+        if (options.iconPath) request.iconPath = options.iconPath;
+        const created = await ML.invoke("plugin:install|install_create_instance", { request });
+
+        const instanceId = created.instance_id || created.instanceId;
+        if (!instanceId) throw new Error("No instance was created");
+        ML.settings.set(packKey(instanceId), { modId: mod.id, fileId: file.id, files: [], overrides: [] });
+        ML.refresh();
+        options.onCreated?.(created);
+
+        await waitForInstance(instanceId, report);
+        const result = await applyPack(pack, instanceId, null, report);
+        ML.settings.set(packKey(instanceId),
+            { modId: mod.id, fileId: file.id, files: result.files, overrides: result.overrides });
+
+        ML.refresh();
+        return { instanceId, total: result.total, blocked: result.blocked };
+    } finally {
+        ML.backend.get(`/cleanup?path=${encodeURIComponent(pack.saved.path)}`).catch(() => {});
+    }
+}
+
+async function updatePack(instanceId, fileId, reset = false) {
+    const previous = packOf(instanceId);
+    if (!previous) throw new Error("This instance was not installed from a CurseForge modpack");
+
+    const file = (await cfGet(`/v1/mods/${previous.modId}/files/${fileId}`)).data;
+    if (!file?.downloadUrl) throw new Error("This pack's author has blocked downloads");
+
+    const pack = await readPack(file, () => {});
+    try {
+        if (reset) {
+            const extra = await ML.invoke("plugin:instance|instance_get_content_items", { instanceId });
+            for (const item of extra) {
+                if (!item.source_kind || item.source_kind === "local") await removeContent(instanceId, item.file_path);
+            }
+        }
+
+        const result = await applyPack(pack, instanceId, previous, () => {}, reset);
+        ML.settings.set(packKey(instanceId),
+            { modId: previous.modId, fileId: file.id, files: result.files, overrides: result.overrides });
+
+        const instance = await ML.invoke("plugin:instance|instance_get", { instanceId });
+        const loaderVersion = pack.loader.version;
+        if (instance.game_version !== pack.gameVersion || instance.loader !== pack.loader.loader
+            || (loaderVersion && instance.loader_version !== loaderVersion)) {
+            const edit = { game_version: pack.gameVersion, loader: pack.loader.loader };
+            if (loaderVersion) edit.loader_version = loaderVersion;
+            await ML.invoke("plugin:instance|instance_edit", { instanceId, editInstance: edit });
+            await ML.invoke("plugin:install|install_existing_instance", { instanceId, force: false });
+        }
+
+        ML.refresh();
+        return result;
+    } finally {
+        ML.backend.get(`/cleanup?path=${encodeURIComponent(pack.saved.path)}`).catch(() => {});
+    }
 }
 
 function ourResults(create = false) {
@@ -1457,6 +1549,9 @@ ML.cf = {
     cleanHtml,
     installFile,
     installPackFile,
+    updatePack,
+    pack: packOf,
+    forgetPack,
     releaseName,
     LOADER_IDS,
     KINDS,

@@ -33,13 +33,13 @@ fn safe_join(dest: &Path, relative: &str) -> Option<PathBuf> {
     Some(out)
 }
 
-pub fn extract_overrides(path: &Path, destination: &Path) -> Result<usize, String> {
+pub fn extract_overrides(path: &Path, destination: &Path) -> Result<Vec<String>, String> {
     if !destination.is_dir() {
         return Err("destination folder does not exist".into());
     }
 
     let mut archive = open(path)?;
-    let mut written = 0;
+    let mut written = Vec::new();
 
     for index in 0..archive.len() {
         let mut entry = archive
@@ -71,7 +71,7 @@ pub fn extract_overrides(path: &Path, destination: &Path) -> Result<usize, Strin
 
         let mut out = File::create(&target).map_err(|e| format!("could not write {relative}: {e}"))?;
         io::copy(&mut entry, &mut out).map_err(|e| format!("could not write {relative}: {e}"))?;
-        written += 1;
+        written.push(relative.to_string());
     }
 
     Ok(written)

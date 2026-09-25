@@ -224,7 +224,7 @@ fn pack_overrides(url: &str) -> Reply {
         return error("destination is not a Modrinth instance folder", 400);
     };
     match crate::pack::extract_overrides(&path, &dest) {
-        Ok(count) => json(serde_json::json!({ "files": count }).to_string(), 200),
+        Ok(paths) => json(serde_json::json!({ "files": paths.len(), "paths": paths }).to_string(), 200),
         Err(message) => error(&message, 400),
     }
 }

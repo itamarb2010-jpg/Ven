@@ -324,9 +324,10 @@ async function installPackFromPage(args) {
 }
 
 const CONTENT_KINDS = ML.cf.KINDS.filter(kind => kind.folder);
-const CHANNELS = { release: [1], beta: [1, 2], alpha: [1, 2, 3] };
+const CHANNELS = { release: 1, beta: 2, alpha: 3 };
 const MOD_TTL = 60000;
 
+const channelLevel = (channel, installed) => Math.max(CHANNELS[channel] || 1, installed || 1);
 const kindOf = path => CONTENT_KINDS.find(kind => (path || "").startsWith(`${kind.folder}/`));
 const contentKey = item => item.id || `${item.file_path}:${item.size}`;
 const onDisk = item => item.enabled === false && !item.file_path.endsWith(".disabled")
@@ -396,19 +397,25 @@ async function modsFor(modIds) {
 }
 
 function newerFile(info, file, instance, kind) {
-    const channel = CHANNELS[instance.update_channel] || CHANNELS.release;
+    const level = channelLevel(instance.update_channel, file.releaseType);
     const loader = ML.cf.LOADER_IDS[instance.loader];
     const newest = Math.max(0, ...(info.latestFilesIndexes || [])
         .filter(index => index.gameVersion === instance.game_version
-            && channel.includes(index.releaseType)
+            && index.releaseType <= level
             && (!kind.loaders || index.modLoader === loader))
         .map(index => index.fileId));
     return newest > file.id ? newest : null;
 }
 
+const ownerOf = info => {
+    const author = info?.authors?.[0];
+    return author
+        ? { id: `cfu${author.id}`, name: author.name, avatar_url: author.avatarUrl || "", type: "user" }
+        : null;
+};
+
 function asContent(item, match, info, instance) {
     const newer = newerFile(info, match.file, instance, kindOf(item.file_path));
-    const author = info.authors?.[0];
     return {
         ...item,
         project: {
@@ -425,9 +432,7 @@ function asContent(item, match, info, instance) {
             file_name: match.file.fileName,
             date_published: match.file.fileDate,
         },
-        owner: author
-            ? { id: `cfu${author.id}`, name: author.name, avatar_url: author.avatarUrl || "", type: "user" }
-            : null,
+        owner: ownerOf(info),
         has_update: !!newer,
         update_version_id: newer ? versionId(info.id, newer) : null,
     };
@@ -499,6 +504,85 @@ async function updateCurseForge(instanceId) {
     }
 }
 
+const everything = new Map();
+
+const logicalPath = item => item.file_path.replace(/\.disabled$/, "");
+const packPaths = pack => new Set([...pack.files.map(file => file.path), ...(pack.overrides || [])]);
+
+async function contentFor(items, args) {
+    const all = await withCurseForge(items, args.instanceId);
+    const pack = ML.cf.pack(args.instanceId);
+    if (!pack || !Array.isArray(all)) return all;
+
+    everything.set(args.instanceId, all);
+    const paths = packPaths(pack);
+    return all.filter(item => !paths.has(logicalPath(item)));
+}
+
+async function packContent(args) {
+    await ML.invoke("plugin:instance|instance_get_content_items", { instanceId: args.instanceId });
+    const paths = packPaths(ML.cf.pack(args.instanceId));
+    return (everything.get(args.instanceId) || [])
+        .filter(item => paths.has(logicalPath(item)))
+        .map(item => ({ ...item, has_update: false, update_version_id: null }));
+}
+
+function withPackLink(instance) {
+    const pack = instance?.id && ML.cf.pack(instance.id);
+    if (!pack || instance.link) return instance;
+    return {
+        ...instance,
+        link: { type: "modrinth_modpack", project_id: projectId(pack.modId), version_id: versionId(pack.modId, pack.fileId) },
+    };
+}
+
+function newerPack(versions, current, channel) {
+    const level = channelLevel(channel, CHANNELS[current.version_type]);
+    const within = versions.filter(version => (CHANNELS[version.version_type] || 1) <= level);
+    return (within.length ? within : versions)
+        .filter(version => new Date(version.date_published) > new Date(current.date_published))
+        .sort((a, b) => new Date(b.date_published) - new Date(a.date_published))[0] || null;
+}
+
+async function packInfo(args) {
+    const pack = ML.cf.pack(args.instanceId);
+    const [project, versions, instance, info] = await Promise.all([
+        projectV2(pack.modId),
+        projectVersions({ projectId: projectId(pack.modId) }),
+        ML.invoke("plugin:instance|instance_get", { instanceId: args.instanceId }),
+        ML.cf.info(pack.modId),
+    ]);
+    if (!project) throw new Error("CurseForge modpack not found");
+
+    const id = versionId(pack.modId, pack.fileId);
+    const current = versions.find(version => version.id === id) || await versionWithChangelog({ id });
+    const update = current && newerPack(versions, current, instance.update_channel);
+    rememberAuthors(info);
+    return {
+        project,
+        version: current,
+        owner: ownerOf(info),
+        has_update: !!update,
+        update_version_id: update?.id || null,
+        update_version: update || null,
+    };
+}
+
+async function packChange(instanceId, fileId, reset, done) {
+    const name = (await ML.cf.info(ML.cf.pack(instanceId).modId))?.name || "Modpack";
+    const result = await ML.cf.updatePack(instanceId, fileId, reset);
+    ML.notify(result.blocked
+        ? `${name} ${done}, ${result.blocked} file(s) blocked by their authors`
+        : `${name} ${done}`);
+    return null;
+}
+
+const updatePackVersion = args =>
+    packChange(args.instanceId, Number(CF_VERSION.exec(args.versionId)[2]), false, "updated");
+
+const reinstallPack = args =>
+    packChange(args.instanceId, ML.cf.pack(args.instanceId).fileId, true, "reinstalled");
+
 const HANDLERS = {
     "plugin:cache|get_project_v3": args => projectV3(modIdOf(args.id)),
     "plugin:cache|get_project": args => projectV2(modIdOf(args.id)),
@@ -509,6 +593,10 @@ const HANDLERS = {
     "plugin:cache|get_version": versionWithChangelog,
     "plugin:cache|get_project_versions": projectVersions,
     "plugin:instance|instance_switch_project_version_with_dependencies": switchVersion,
+    "plugin:instance|instance_get_linked_modpack_info": packInfo,
+    "plugin:instance|instance_get_linked_modpack_content": packContent,
+    "plugin:instance|instance_update_managed_modrinth_version": updatePackVersion,
+    "plugin:instance|instance_repair_managed_modrinth": reinstallPack,
     "plugin:instance|instance_install_project_with_dependencies": installFromPage,
     "plugin:install|install_create_modpack_instance": installPackFromPage,
     "plugin:http|fetch": startApiRequest,
@@ -534,6 +622,13 @@ function isOurs(command, args) {
     if (command === "plugin:instance|instance_switch_project_version_with_dependencies") {
         return CF_VERSION.test(args.versionId || "");
     }
+    if (command.startsWith("plugin:instance|instance_get_linked_modpack")
+        || command === "plugin:instance|instance_repair_managed_modrinth") {
+        return !!ML.cf.pack(args.instanceId);
+    }
+    if (command === "plugin:instance|instance_update_managed_modrinth_version") {
+        return !!ML.cf.pack(args.instanceId) && CF_VERSION.test(args.versionId || "");
+    }
     if (command === "plugin:cache|get_team" || command === "plugin:cache|get_organization") {
         return CF_TEAM.test(args.id || "");
     }
@@ -557,9 +652,22 @@ const REWRITES = {
     },
 };
 
+const withPackLinks = instances => Array.isArray(instances) ? instances.map(withPackLink) : instances;
+
 const RESULTS = {
-    "plugin:instance|instance_get_content_items": (items, args) => withCurseForge(items, args.instanceId),
+    "plugin:instance|instance_get": withPackLink,
+    "plugin:instance|instance_list": withPackLinks,
+    "plugin:instance|instance_get_many": withPackLinks,
+    "plugin:instance|instance_get_content_items": contentFor,
     "plugin:instance|instance_update_all": (result, args) => updateCurseForge(args.instanceId).then(() => result),
+    "plugin:instance|instance_edit": (result, args) => {
+        if (args.editInstance?.link === null) ML.cf.forgetPack(args.instanceId);
+        return result;
+    },
+    "plugin:instance|instance_remove": (result, args) => {
+        ML.cf.forgetPack(args.instanceId);
+        return result;
+    },
 };
 
 const CF_API = /^https:\/\/api\.modrinth\.com\/v\d\/(?:[a-z]+\/)?(?:user|project|version)\/cf/;
