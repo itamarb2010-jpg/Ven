@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 
 mod backend;
+mod fingerprint;
 mod key;
 mod pack;
 

@@ -31,8 +31,11 @@ function descriptionFor(modId) {
     return descriptions.get(modId);
 }
 
+const isGameVersion = tag => /^\d+(\.\d+)+$/.test(tag);
+const byVersion = (a, b) => a.localeCompare(b, undefined, { numeric: true });
+
 const gameVersionsOf = files =>
-    [...new Set(files.flatMap(file => (file.gameVersions || []).filter(tag => /^\d/.test(tag))))];
+    [...new Set(files.flatMap(file => (file.gameVersions || []).filter(isGameVersion)))];
 
 const loadersOf = files =>
     [...new Set(files.flatMap(file =>
@@ -177,7 +180,7 @@ function asVersion(file, modId, info, featured) {
             file_name: null,
             dependency_type: "required",
         })),
-        game_versions: tags.filter(tag => /^\d/.test(tag)),
+        game_versions: tags.filter(isGameVersion).sort(byVersion),
         loaders: tags.map(tag => tag.toLowerCase()).filter(tag => ML.cf.LOADER_IDS[tag]),
     };
 }
@@ -320,6 +323,182 @@ async function installPackFromPage(args) {
     });
 }
 
+const CONTENT_KINDS = ML.cf.KINDS.filter(kind => kind.folder);
+const CHANNELS = { release: [1], beta: [1, 2], alpha: [1, 2, 3] };
+const MOD_TTL = 60000;
+
+const kindOf = path => CONTENT_KINDS.find(kind => (path || "").startsWith(`${kind.folder}/`));
+const contentKey = item => item.id || `${item.file_path}:${item.size}`;
+const onDisk = item => item.enabled === false && !item.file_path.endsWith(".disabled")
+    ? `${item.file_path}.disabled`
+    : item.file_path;
+
+const matches = new Map();
+const mods = new Map();
+
+async function fileFor(modId, fileId) {
+    const files = await filesFor(modId).catch(() => []);
+    const known = files.find(file => file.id === fileId);
+    if (known) return known;
+    const data = await ML.cf.get(`/v1/mods/${modId}/files/${fileId}`).catch(() => null);
+    return data?.data || null;
+}
+
+async function projectVersions(args) {
+    const modId = modIdOf(args.projectId);
+    const [info, files] = await Promise.all([ML.cf.info(modId), filesFor(modId)]);
+    return files.map(file => asVersion(file, modId, info, file.id === files[0].id));
+}
+
+async function versionWithChangelog(args) {
+    const [, modId, fileId] = CF_VERSION.exec(args.id).map(Number);
+    const [info, file, notes] = await Promise.all([
+        ML.cf.info(modId),
+        fileFor(modId, fileId),
+        ML.cf.get(`/v1/mods/${modId}/files/${fileId}/changelog`).catch(() => null),
+    ]);
+    if (!file) return null;
+    return { ...asVersion(file, modId, info, false), changelog: ML.cf.cleanHtml(notes?.data || "").trim() };
+}
+
+async function lookUpFiles(instanceId, items) {
+    const folder = await ML.invoke("plugin:instance|instance_get_full_path", { instanceId });
+    const prints = await ML.backend.get(`/fingerprints?dest=${encodeURIComponent(folder)}`,
+        { "x-files": JSON.stringify(items.map(onDisk)) });
+    const wanted = [...new Set(Object.values(prints))];
+    const data = wanted.length ? await ML.cf.post("/v1/fingerprints/432", { fingerprints: wanted }) : null;
+    const byPrint = new Map((data?.data?.exactMatches || [])
+        .map(match => [match.file.fileFingerprint, { modId: match.id, file: match.file }]));
+    return item => byPrint.get(prints[onDisk(item)]) || null;
+}
+
+function matchFiles(instanceId, items) {
+    const missing = items.filter(item => !matches.has(contentKey(item)));
+    if (missing.length) {
+        const lookup = lookUpFiles(instanceId, missing);
+        for (const item of missing) {
+            const key = contentKey(item);
+            matches.set(key, lookup.then(find => find(item)));
+            lookup.catch(() => matches.delete(key));
+        }
+    }
+    return Promise.all(items.map(item => matches.get(contentKey(item)).catch(() => null)));
+}
+
+async function modsFor(modIds) {
+    const now = Date.now();
+    const stale = modIds.filter(modId => now - (mods.get(modId)?.at || 0) >= MOD_TTL);
+    if (stale.length) {
+        const data = await ML.cf.post("/v1/mods", { modIds: stale }).catch(() => null);
+        for (const info of data?.data || []) mods.set(info.id, { info, at: now });
+    }
+    return new Map(modIds.filter(modId => mods.has(modId)).map(modId => [modId, mods.get(modId).info]));
+}
+
+function newerFile(info, file, instance, kind) {
+    const channel = CHANNELS[instance.update_channel] || CHANNELS.release;
+    const loader = ML.cf.LOADER_IDS[instance.loader];
+    const newest = Math.max(0, ...(info.latestFilesIndexes || [])
+        .filter(index => index.gameVersion === instance.game_version
+            && channel.includes(index.releaseType)
+            && (!kind.loaders || index.modLoader === loader))
+        .map(index => index.fileId));
+    return newest > file.id ? newest : null;
+}
+
+function asContent(item, match, info, instance) {
+    const newer = newerFile(info, match.file, instance, kindOf(item.file_path));
+    const author = info.authors?.[0];
+    return {
+        ...item,
+        project: {
+            id: projectId(info.id),
+            slug: null,
+            title: info.name,
+            icon_url: info.logo?.thumbnailUrl || info.logo?.url || null,
+            categories: [],
+            additional_categories: [],
+        },
+        version: {
+            id: versionId(info.id, match.file.id),
+            version_number: ML.cf.versionLabel(match.file, info),
+            file_name: match.file.fileName,
+            date_published: match.file.fileDate,
+        },
+        owner: author
+            ? { id: `cfu${author.id}`, name: author.name, avatar_url: author.avatarUrl || "", type: "user" }
+            : null,
+        has_update: !!newer,
+        update_version_id: newer ? versionId(info.id, newer) : null,
+    };
+}
+
+async function withCurseForge(items, instanceId) {
+    await ML.cfKey.ready;
+    if (!ML.cfKey.saved || !Array.isArray(items)) return items;
+
+    const unknown = items.filter(item => !item.project && kindOf(item.file_path));
+    if (!unknown.length) return items;
+
+    const found = await matchFiles(instanceId, unknown);
+    const matched = unknown.map((item, index) => [item, found[index]]).filter(([, match]) => match);
+    if (!matched.length) return items;
+
+    const [instance, infos] = await Promise.all([
+        ML.invoke("plugin:instance|instance_get", { instanceId }),
+        modsFor([...new Set(matched.map(([, match]) => match.modId))]),
+    ]);
+    const recognised = new Map();
+    for (const [item, match] of matched) {
+        const info = infos.get(match.modId);
+        if (!info) continue;
+        rememberAuthors(info);
+        recognised.set(item, asContent(item, match, info, instance));
+    }
+    return items.map(item => recognised.get(item) || item);
+}
+
+async function switchVersion(args) {
+    const { instanceId, projectPath } = args;
+    const [, modId, fileId] = CF_VERSION.exec(args.versionId).map(Number);
+    const kind = kindOf(projectPath);
+    const [instance, file, items] = await Promise.all([
+        ML.invoke("plugin:instance|instance_get", { instanceId }),
+        fileFor(modId, fileId),
+        ML.invoke("plugin:instance|instance_get_content_items", { instanceId }),
+    ]);
+    if (!instance || !kind || !file?.downloadUrl) throw new Error("no such instance or version");
+
+    const disabled = items.find(item => item.file_path === projectPath)?.enabled === false;
+    const toggle = (path, enabled) => ML.invoke("plugin:instance|instance_toggle_disable_project",
+        { instanceId, projectPath: path, desiredEnabled: enabled });
+    const placed = `${kind.folder}/${file.fileName}`;
+    let current = projectPath;
+
+    if (disabled) await toggle(projectPath, true);
+    try {
+        await ML.cf.installFile(file, modId, instance, kind);
+        if (projectPath !== placed) {
+            await ML.invoke("plugin:instance|instance_remove_project", { instanceId, projectPath });
+        }
+        current = placed;
+    } finally {
+        if (disabled) await toggle(current, false);
+    }
+    ML.settings.set(`installed:${instanceId}:${modId}`, file.fileName);
+    return null;
+}
+
+async function updateCurseForge(instanceId) {
+    const items = await ML.invoke("plugin:instance|instance_get_content_items", { instanceId });
+    for (const item of items) {
+        if (!item.has_update || item.locked || !CF_VERSION.test(item.update_version_id || "")) continue;
+        if (item.source_kind && item.source_kind !== "local") continue;
+        await switchVersion({ instanceId, projectPath: item.file_path, versionId: item.update_version_id })
+            .catch(e => ML.notify(`${item.project.title}: ${e.message}`));
+    }
+}
+
 const HANDLERS = {
     "plugin:cache|get_project_v3": args => projectV3(modIdOf(args.id)),
     "plugin:cache|get_project": args => projectV2(modIdOf(args.id)),
@@ -327,6 +506,9 @@ const HANDLERS = {
     "plugin:cache|get_team": args => teamFor(teamModIdOf(args.id)),
     "plugin:cache|get_organization": () => null,
     "plugin:cache|get_version_many": versionsFor,
+    "plugin:cache|get_version": versionWithChangelog,
+    "plugin:cache|get_project_versions": projectVersions,
+    "plugin:instance|instance_switch_project_version_with_dependencies": switchVersion,
     "plugin:instance|instance_install_project_with_dependencies": installFromPage,
     "plugin:install|install_create_modpack_instance": installPackFromPage,
     "plugin:http|fetch": startApiRequest,
@@ -347,6 +529,11 @@ function isOurs(command, args) {
     }
     if (command === "plugin:cache|get_project_many") return (args.ids || []).some(id => CF_PROJECT.test(id));
     if (command === "plugin:cache|get_version_many") return (args.ids || []).some(id => CF_VERSION.test(id));
+    if (command === "plugin:cache|get_version") return CF_VERSION.test(args.id || "");
+    if (command === "plugin:cache|get_project_versions") return CF_PROJECT.test(args.projectId || "");
+    if (command === "plugin:instance|instance_switch_project_version_with_dependencies") {
+        return CF_VERSION.test(args.versionId || "");
+    }
     if (command === "plugin:cache|get_team" || command === "plugin:cache|get_organization") {
         return CF_TEAM.test(args.id || "");
     }
@@ -368,6 +555,11 @@ const REWRITES = {
         const url = await curseForgeUrl(args.url);
         return url ? { ...args, url } : null;
     },
+};
+
+const RESULTS = {
+    "plugin:instance|instance_get_content_items": (items, args) => withCurseForge(items, args.instanceId),
+    "plugin:instance|instance_update_all": (result, args) => updateCurseForge(args.instanceId).then(() => result),
 };
 
 const CF_API = /^https:\/\/api\.modrinth\.com\/v\d\/(?:[a-z]+\/)?(?:user|project|version)\/cf/;
@@ -446,6 +638,17 @@ const fail = message => new Response(JSON.stringify({ field_name: "Ven", message
     headers: { "content-type": "application/json", "tauri-response": "error" },
 });
 
+async function withResult(pending, after, args) {
+    const response = await pending;
+    if (response.headers.get("tauri-response") !== "ok") return response;
+    try {
+        return reply(await after(await response.clone().json(), args));
+    } catch (e) {
+        console.error("[ML] content data failed:", e);
+        return response;
+    }
+}
+
 const reply = data => data instanceof Uint8Array
     ? new Response(data, {
         status: 200,
@@ -468,7 +671,8 @@ function hookFetch() {
         const command = decodeURIComponent(url.slice(url.lastIndexOf("/") + 1));
         const handler = HANDLERS[command];
         const rewrite = REWRITES[command];
-        if ((!handler && !rewrite) || typeof init?.body !== "string") return original(input, init);
+        const after = RESULTS[command];
+        if ((!handler && !rewrite && !after) || typeof init?.body !== "string") return original(input, init);
 
         let args;
         try {
@@ -481,6 +685,7 @@ function hookFetch() {
             const changed = await rewrite(args).catch(() => null);
             return original(input, changed ? { ...init, body: JSON.stringify(changed) } : init);
         }
+        if (after) return withResult(original(input, init), after, args);
         if (!isOurs(command, args)) return original(input, init);
 
         try {
@@ -529,9 +734,10 @@ async function fillChangelog(to) {
 
 function openAuthor(to, from) {
     const match = /^\/user\/([^/]+)/.exec(to.path);
-    if (!match || !/^\/project\/cf\d+/.test(from.path)) return true;
+    if (!match) return true;
 
     const name = decodeURIComponent(match[1]);
+    if (!/^\/project\/cf\d+/.test(from.path) && !/^cf[au]\d+$/.test(name)) return true;
     const known = authors.get(name) || [...authors.values()].find(entry => entry.author.name === name);
     if (!known) return true;
     if (known.author.url) ML.invoke("plugin:opener|open_url", { url: known.author.url });

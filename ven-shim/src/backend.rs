@@ -1,10 +1,11 @@
 use sha1::Digest;
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const CF_API: &str = "https://api.curseforge.com";
 const DOWNLOAD_HOSTS: [&str; 3] = ["edge.forgecdn.net", "mediafilez.forgecdn.net", "media.forgecdn.net"];
 const MAX_REDIRECTS: usize = 5;
+const CONTENT_FOLDERS: [&str; 4] = ["mods", "resourcepacks", "shaderpacks", "datapacks"];
 const RESERVED_NAMES: [&str; 24] = [
     "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$",
     "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
@@ -127,15 +128,18 @@ fn verify(bytes: &[u8], url: &str) -> Result<(), String> {
     }
 }
 
-fn proxy_curseforge(url: &str, api_key: &str) -> Reply {
+fn proxy_curseforge(url: &str, api_key: &str, body: Option<String>) -> Reply {
     let rest = url.trim_start_matches("/cf/");
     let target = format!("{CF_API}/{rest}");
-
-    match ureq::get(&target)
+    let request = |method| ureq::request(method, &target)
         .set("x-api-key", api_key)
-        .set("Accept", "application/json")
-        .call()
-    {
+        .set("Accept", "application/json");
+
+    let result = match body {
+        Some(body) => request("POST").set("Content-Type", "application/json").send_string(&body),
+        None => request("GET").call(),
+    };
+    match result {
         Ok(resp) => match resp.into_string() {
             Ok(body) => json(body, 200),
             Err(e) => error(&format!("bad response body: {e}"), 502),
@@ -225,6 +229,32 @@ fn pack_overrides(url: &str) -> Reply {
     }
 }
 
+fn content_file(folder: &Path, relative: &str) -> Option<PathBuf> {
+    let (kind, name) = relative.split_once('/')?;
+    (CONTENT_FOLDERS.contains(&kind) && plain_name(name)).then(|| folder.join(kind).join(name))
+}
+
+fn fingerprints(url: &str, headers: &serde_json::Value) -> Reply {
+    let Some(dest) = query_param(url, "dest") else {
+        return error("missing dest", 400);
+    };
+    let Some(folder) = instance_folder(&dest) else {
+        return error("destination is not a Modrinth instance folder", 400);
+    };
+    let files: Vec<String> = header(headers, "x-files")
+        .and_then(|list| serde_json::from_str(&list).ok())
+        .unwrap_or_default();
+
+    let mut found = serde_json::Map::new();
+    for relative in files {
+        let Some(path) = content_file(&folder, &relative) else { continue };
+        if let Ok(value) = crate::fingerprint::of(&path) {
+            found.insert(relative, value.into());
+        }
+    }
+    json(serde_json::Value::Object(found).to_string(), 200)
+}
+
 fn key_status() -> Reply {
     let length = crate::key::load().map_or(0, |key| key.chars().count());
     json(serde_json::json!({ "saved": length > 0, "length": length }).to_string(), 200)
@@ -233,7 +263,7 @@ fn key_status() -> Reply {
 pub fn handle(url: &str, headers: &serde_json::Value) -> Reply {
     if url.starts_with("/cf/") {
         match crate::key::load() {
-            Some(key) if !key.is_empty() => proxy_curseforge(url, &key),
+            Some(key) if !key.is_empty() => proxy_curseforge(url, &key, header(headers, "x-body")),
             _ => error("missing CurseForge API key", 400),
         }
     } else if url.starts_with("/download") {
@@ -251,6 +281,8 @@ pub fn handle(url: &str, headers: &serde_json::Value) -> Reply {
         pack_manifest(url)
     } else if url.starts_with("/pack/overrides") {
         pack_overrides(url)
+    } else if url.starts_with("/fingerprints") {
+        fingerprints(url, headers)
     } else {
         error("not found", 404)
     }

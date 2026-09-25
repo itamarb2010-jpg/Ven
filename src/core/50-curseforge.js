@@ -81,6 +81,7 @@ let lastPath = location.pathname;
 const listeners = new AbortController();
 
 const cfGet = path => ML.backend.get(`/cf${path}`);
+const cfPost = (path, body) => ML.backend.get(`/cf${path}`, { "x-body": JSON.stringify(body) });
 
 async function currentInstance() {
     const id = new URLSearchParams(location.search).get("i");
@@ -452,7 +453,7 @@ async function installMod(mod, instance, report, allowAny = false) {
 async function installFile(file, modId, instance, kind, report = () => {}) {
     const present = await installedFileNames(instance);
     const seen = new Set([modId]);
-    const resolved = await requiredDependencies(file, instance, kind, seen);
+    const resolved = kind.loaders ? await requiredDependencies(file, instance, kind, seen) : [];
 
     const dependencies = [];
     for (const dep of resolved) {
@@ -1154,121 +1155,7 @@ async function runSearch(force = false) {
     }
 }
 
-const ROW_BUTTON_CLASSES = "relative inline-flex min-w-0 shrink-0 items-center justify-center whitespace-nowrap border-0 no-underline touch-manipulation cursor-pointer select-none transition-[background-color,color,box-shadow,filter,opacity,transform] duration-150 ease-out enabled:active:scale-[0.97] [&:not(:disabled):not([aria-disabled=true]):hover]:brightness-[--hover-brightness] [&:not(:disabled):not([aria-disabled=true]):focus-visible]:brightness-[--hover-brightness] focus-visible:outline-none [&:not(:disabled):not([aria-disabled=true]):focus-visible]:ring-4 [&:not(:disabled):not([aria-disabled=true]):focus-visible]:ring-brand-shadow disabled:cursor-not-allowed disabled:opacity-50 [&[aria-disabled=true]]:cursor-not-allowed [&[aria-disabled=true]]:opacity-50 button-frame--quiet bg-transparent [&>svg]:text-inherit [&:not(:disabled):not([aria-disabled=true]):hover]:bg-surface-4 [&:not(:disabled):not([aria-disabled=true]):focus-visible]:bg-surface-4 h-9 gap-1.5 rounded-xl px-2.5 text-base font-semibold leading-5 [&>svg]:size-5 [&>svg]:min-h-5 [&>svg]:min-w-5 [&>svg]:shrink-0 w-9 !px-0 !rounded-full";
-
-const UPDATE_BUTTON_CLASSES = `${ROW_BUTTON_CLASSES} hover:!bg-green focus-visible:!bg-green hover:!text-[var(--color-accent-contrast)] focus-visible:!text-[var(--color-accent-contrast)]`;
-
 const DOWNLOAD_ICON = `<svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" class="size-5"><path stroke-linecap="round" stroke-linejoin="round" d="M4 16v1a3 3 0 0 0 3 3h10a3 3 0 0 0 3-3v-1m-4-4-4 4m0 0-4-4m4 4V4"/></svg>`;
-
-const updateChecks = new Map();
-
-const instanceIdFromRoute = () => {
-    const match = location.pathname.match(/^\/instance\/([^/]+)/);
-    return match ? decodeURIComponent(match[1]) : null;
-};
-
-function venInstalls(instanceId) {
-    const saved = ML.store.all().curseforge || {};
-    const prefix = `installed:${instanceId}:`;
-    return Object.entries(saved)
-        .filter(([key, value]) => key.startsWith(prefix) && value)
-        .map(([key, fileName]) => ({ modId: Number(key.slice(prefix.length)), fileName }));
-}
-
-function addUpdateButton(row, onClick) {
-    const actions = [...row.children].find(child =>
-        child.className.includes("justify-end")) || row.lastElementChild;
-    if (!actions || actions.querySelector(".ven-update")) return;
-    if (row.querySelector('button[aria-label="Update available"]')) return;
-
-    row.querySelector(".ven-switch")?.remove();
-
-    const slot = document.createElement("div");
-    slot.className = "ven-update flex w-8 items-center justify-center";
-
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = UPDATE_BUTTON_CLASSES;
-    applyButtonScope(button);
-    button.style.setProperty("--button-color", "var(--color-green)");
-    button.setAttribute("aria-label", "Update available");
-    button.innerHTML = DOWNLOAD_ICON;
-    button.addEventListener("click", event => {
-        event.preventDefault();
-        event.stopPropagation();
-        button.disabled = true;
-        onClick(button);
-    });
-
-    slot.appendChild(button);
-    actions.insertBefore(slot, actions.firstChild);
-}
-
-async function applyUpdate(instance, kind, entry, newer, button) {
-    const oldPath = `${kind.folder}/${entry.fileName}`;
-
-    await placeFile(newer, instance, kind);
-    await ML.invoke("plugin:instance|instance_remove_project", {
-        instanceId: instance.id,
-        projectPath: oldPath,
-    }).catch(() => {});
-
-    ML.settings.set(`installed:${instance.id}:${entry.modId}`, newer.fileName);
-    updateChecks.delete(`${instance.id}:${entry.modId}:${entry.fileName}`);
-    ML.notify(`Updated to ${newer.fileName}`);
-    button?.closest(".ven-update")?.remove();
-    ML.refresh();
-}
-
-async function checkContentUpdates() {
-    const instanceId = instanceIdFromRoute();
-    if (!instanceId) return;
-
-    const rows = [...document.querySelectorAll("[data-content-card-item]")];
-    if (!rows.length) return;
-
-    const entries = venInstalls(instanceId);
-    if (!entries.length) return;
-
-    const instance = (await ML.invoke("plugin:instance|instance_list"))
-        .find(i => i.id === instanceId);
-    if (!instance) return;
-
-    for (const entry of entries) {
-        const row = rows.find(r =>
-            (r.getAttribute("data-content-card-item") || "").endsWith(`/${entry.fileName}`));
-        if (!row || row.querySelector(".ven-update")) continue;
-
-        const folder = row.getAttribute("data-content-card-item").split("/")[0];
-        const kind = KINDS.find(candidate => candidate.folder === folder);
-        if (!kind) continue;
-
-        const info = await modInfo(entry.modId);
-        if (info) {
-            showAuthor(row, info);
-            showIcon(row, info);
-        }
-
-        const cacheKey = `${instanceId}:${entry.modId}:${entry.fileName}`;
-        if (!updateChecks.has(cacheKey)) {
-            updateChecks.set(cacheKey, null);
-            try {
-                const newest = pickFile(await filesFor(entry.modId, instance, kind));
-                updateChecks.set(cacheKey,
-                    newest && newest.fileName !== entry.fileName ? newest : null);
-            } catch {
-                updateChecks.set(cacheKey, null);
-            }
-        }
-
-        const newer = updateChecks.get(cacheKey);
-        if (newer) {
-            addUpdateButton(row, button => applyUpdate(instance, kind, entry, newer, button));
-        } else if (info) {
-            addSwitchButton(row, () => openVersionPicker(instance, kind, entry, info));
-        }
-    }
-}
 
 const { text, CLOSE_ICON, CLOSE_BUTTON_CLASSES } = ML.ui;
 
@@ -1285,55 +1172,7 @@ async function modInfo(modId) {
 
 const WARN_ICON = `<svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" class="size-5"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3M12 9v4M12 17h.01"/></svg>`;
 
-const FILE_ICON = `<svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" class="size-5"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M16 13H8M16 17H8M10 9H8"/></svg>`;
-
 const EYE_ICON = `<svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" class="size-4"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7"/><circle cx="12" cy="12" r="3"/></svg>`;
-
-const DOWNLOAD_SMALL = `<svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" class="size-4"><path d="M4 16v1a3 3 0 0 0 3 3h10a3 3 0 0 0 3-3v-1m-4-4-4 4m0 0-4-4m4 4V4"/></svg>`;
-
-const X_SMALL = `<svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" class="size-4"><path d="M18 6 6 18M6 6l12 12"/></svg>`;
-
-const SWAP_ICON = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" class="lucide lucide-arrow-left-right-icon lucide-arrow-left-right size-5" viewBox="0 0 24 24"><path d="M8 3 4 7l4 4M4 7h16M16 21l4-4-4-4M20 17H4"/></svg>`;
-
-function projectIcon(row) {
-    return row.querySelector("img.avatar:not(.circle)");
-}
-
-function showAuthor(row, info) {
-    const uploaded = [...row.querySelectorAll("span")]
-        .find(el => el.textContent.trim() === "Uploaded");
-    const holder = uploaded?.closest("span");
-    const author = info.authors?.[0];
-    if (!holder || !author || holder.dataset.ven) return;
-
-    holder.dataset.ven = "1";
-
-    const label = document.createElement("span");
-    label.className = "text-sm leading-5";
-    label.textContent = author.name;
-
-    const template = projectIcon(row);
-    if (author.avatarUrl && template) {
-        const avatar = template.cloneNode(false);
-        avatar.className = "shrink-0";
-        avatar.removeAttribute("srcset");
-        avatar.style.cssText = "width:1.5rem;height:1.5rem;border-radius:999px;object-fit:cover;";
-        avatar.src = author.avatarUrl;
-        avatar.alt = author.name;
-        holder.replaceChildren(avatar, label);
-    } else {
-        holder.replaceChildren(label);
-    }
-}
-
-function showIcon(row, info) {
-    const image = projectIcon(row);
-    const logo = info.logo?.thumbnailUrl || info.logo?.url;
-    if (!image || !logo || image.dataset.ven) return;
-    image.dataset.ven = "1";
-    image.removeAttribute("srcset");
-    image.src = logo;
-}
 
 let buttonScope;
 
@@ -1349,37 +1188,9 @@ function applyButtonScope(button) {
 }
 
 const V = {
-    main: "flex h-[min(550px,calc(95vh-10rem))] border-solid border-transparent border-[1px] border-b-surface-4",
-    left: "w-[300px] flex flex-col relative",
-    searchWrap: "p-4 pb-2",
-    scroller: "flex-1 overflow-y-auto px-4 pb-16",
-    list: "flex flex-col gap-1.5",
-    item: "flex items-center h-10 px-4 py-2.5 rounded-xl border-none cursor-pointer transition-colors",
-    itemSelected: "bg-brand-highlight",
-    itemIdle: "bg-transparent hover:bg-button-bg",
-    itemInner: "flex items-center justify-between w-full gap-2",
-    itemLeft: "flex items-center gap-2 min-w-0",
-    badge: "flex font-bold justify-center items-center rounded-full text-xs w-7 h-7 shrink-0",
-    badgeRelease: "bg-bg-green text-brand-green",
-    itemName: "font-semibold text-contrast truncate",
-    currentChip: "rounded-full text-sm font-medium flex items-center flex-shrink-0 border border-solid bg-surface-4 border-surface-5 text-primary px-2.5 py-0.5",
-    detailHead: "bg-bg p-4",
-    detailStack: "flex flex-col gap-1.5",
-    detailRow: "flex items-center justify-between",
-    detailLeft: "flex items-center gap-2",
-    detailName: "font-semibold text-xl text-contrast",
-    releaseChip: "px-2.5 py-0.5 rounded-full text-sm font-medium flex items-center flex-shrink-0 border border-solid",
-    releaseChipGreen: "bg-highlight-green border-green text-green",
-    detailDate: "font-medium text-primary",
-    detailMeta: "flex items-center gap-2 text-primary",
-    divider: "h-px bg-divider",
-    bodyWrap: "flex-1 min-h-0 bg-bg overflow-y-auto p-4",
-    markdown: "markdown-body",
-    footer: "w-full flex flex-row items-center gap-4 p-4 border-solid border-x-0 border-b-0 border-t border-surface-4",
     button: "relative inline-flex min-w-0 shrink-0 items-center justify-center whitespace-nowrap border-0 no-underline touch-manipulation cursor-pointer select-none transition-[background-color,color,box-shadow,filter,opacity,transform] duration-150 ease-out enabled:active:scale-[0.97] [&:not(:disabled):not([aria-disabled=true]):hover]:brightness-[--hover-brightness] [&:not(:disabled):not([aria-disabled=true]):focus-visible]:brightness-[--hover-brightness] focus-visible:outline-none [&:not(:disabled):not([aria-disabled=true]):focus-visible]:ring-4 [&:not(:disabled):not([aria-disabled=true]):focus-visible]:ring-brand-shadow disabled:cursor-not-allowed disabled:opacity-50 [&[aria-disabled=true]]:cursor-not-allowed [&[aria-disabled=true]]:opacity-50 h-9 gap-1.5 rounded-xl px-2.5 text-base font-semibold leading-5 [&>svg]:size-5 [&>svg]:min-h-5 [&>svg]:min-w-5 [&>svg]:shrink-0",
     outlined: "button-frame--outlined bg-transparent text-[var(--button-color,var(--color-contrast))] [&>svg]:text-[var(--button-color,var(--color-base))]",
     colored: "button-frame--colored bg-[--button-color] text-[var(--color-accent-contrast)] [&>svg]:text-inherit",
-    quiet: "button-frame--quiet bg-transparent [&>svg]:text-inherit [&:not(:disabled):not([aria-disabled=true]):hover]:bg-surface-4 [&:not(:disabled):not([aria-disabled=true]):focus-visible]:bg-surface-4",
 };
 
 const INSTALL_MODAL = {
@@ -1475,31 +1286,8 @@ function chipButton(label, selected) {
     return chip;
 }
 
-const RELEASE_TINT = { 2: "#e5a13a", 3: "#e65a5a" };
 const RELEASE_NAME = { 1: "Release", 2: "Beta", 3: "Alpha" };
 const releaseName = file => RELEASE_NAME[file.releaseType] || "Release";
-
-function releaseBadge(file) {
-    const badge = document.createElement("div");
-    badge.className = `${V.badge} ${file.releaseType === 1 ? V.badgeRelease : ""}`;
-    const tint = RELEASE_TINT[file.releaseType];
-    if (tint) {
-        badge.style.cssText = `background:color-mix(in srgb, ${tint} 22%, transparent);color:${tint};`;
-    }
-    badge.textContent = releaseName(file)[0];
-    return badge;
-}
-
-function releaseChip(file) {
-    const chip = document.createElement("span");
-    chip.className = `${V.releaseChip} ${file.releaseType === 1 ? V.releaseChipGreen : ""}`;
-    const tint = RELEASE_TINT[file.releaseType];
-    if (tint) {
-        chip.style.cssText = `background:color-mix(in srgb, ${tint} 18%, transparent);border-color:color-mix(in srgb, ${tint} 45%, transparent);color:${tint};`;
-    }
-    chip.textContent = releaseName(file);
-    return chip;
-}
 
 function versionLabel(file, info) {
     const raw = (file.displayName || file.fileName).replace(/\.(jar|zip)$/i, "");
@@ -1513,9 +1301,6 @@ function versionLabel(file, info) {
     }
     return raw;
 }
-
-const gameVersionsOf = file =>
-    (file.gameVersions || []).filter(v => /^\d/.test(v)).join(", ");
 
 function decodeChangelog(html) {
     const markup = html || "";
@@ -1541,389 +1326,11 @@ const cleanHtml = html => ML.purify.sanitize(decodeChangelog(html), {
     ADD_ATTR: ["target", "allowfullscreen", "frameborder", "start", "end"],
 });
 
-function safeChangelog(html) {
-    const holder = document.createElement("div");
-    holder.innerHTML = ML.purify.sanitize(decodeChangelog(html), {
-        FORBID_TAGS: ["style"],
-        ADD_ATTR: ["target"],
-    });
-    return holder;
-}
-
 function iconSpan(svg) {
     const span = document.createElement("span");
     span.className = "flex shrink-0 items-center";
     span.innerHTML = svg;
     return span;
-}
-
-async function openFallbackVersionPicker(instance, kind, entry, info) {
-    document.getElementById("ven-versions")?.remove();
-    ML.ui.ensureStyle();
-
-    const root = document.createElement("div");
-    root.id = "ven-versions";
-    root.style.cssText = "position:fixed;inset:0;z-index:1100;display:flex;align-items:center;justify-content:center;";
-    root.innerHTML = `
-      <div class="ven-overlay" style="position:absolute;inset:0;background:rgba(0,0,0,.55);"></div>
-      <div class="modal-body flex flex-col bg-bg-raised rounded-2xl border border-solid border-surface-5 outline-none"
-           style="position:relative;width:min(94vw,58rem);max-height:92vh;">
-        <div class="grid grid-cols-[1fr_auto] items-center gap-4 p-6">
-          <div class="flex text-wrap break-words items-center gap-3 min-w-0">
-            <span class="ven-project-icon flex shrink-0"></span>
-            <span class="text-lg font-extrabold text-contrast">Switch version</span>
-          </div>
-          <div class="flex items-center gap-2">
-            <button class="VEN_CLOSE_CLASSES" aria-label="Close">VEN_CLOSE_ICON</button>
-          </div>
-        </div>
-
-        <div class="min-h-0">
-          <div class="${V.main}">
-            <div class="${V.left}">
-              <div class="${V.searchWrap}">
-                <input class="ven-input ven-search w-full rounded-xl px-3 py-2 text-sm" placeholder="Search version...">
-              </div>
-              <div class="${V.scroller}">
-                <div class="min-h-full">
-                  <div class="ven-version-list ${V.list}"></div>
-                </div>
-              </div>
-              <div class="absolute bottom-0 left-0 right-0 p-3">
-                <button data-button class="ven-incompatible ${V.button} ${V.quiet}"></button>
-              </div>
-            </div>
-
-            <div class="w-px bg-divider" style="background:var(--color-divider);"></div>
-
-            <div class="ven-detail flex-1 flex flex-col min-w-0"></div>
-          </div>
-
-          <div class="${V.footer}">
-            <div class="flex flex-row items-center gap-2 min-w-0">
-              <span class="ven-warn-icon flex shrink-0" style="color:#e5a13a;"></span>
-              <span class="text-sm" style="color:#e5a13a;">Updating can break your instance. Review version changelogs and back up first.</span>
-            </div>
-            <div class="flex flex-row gap-2 shrink-0 ml-auto">
-              <button data-button class="ven-cancel ${V.button} ${V.outlined}"></button>
-              <button data-button class="ven-confirm ${V.button} ${V.colored}" style="--button-color: var(--color-brand);"></button>
-            </div>
-          </div>
-        </div>
-      </div>`
-        .replace("VEN_CLOSE_CLASSES", CLOSE_BUTTON_CLASSES)
-        .replace("VEN_CLOSE_ICON", CLOSE_ICON);
-
-    const close = () => root.remove();
-    root.querySelector(".ven-overlay").addEventListener("click", close);
-    root.querySelector("button[aria-label=Close]").addEventListener("click", close);
-    document.body.appendChild(root);
-
-    const logo = info?.logo?.thumbnailUrl || info?.logo?.url;
-    if (logo) {
-        const image = document.createElement("img");
-        image.src = logo;
-        image.alt = info.name || "";
-        image.style.cssText = "width:2.25rem;height:2.25rem;border-radius:.6rem;object-fit:cover;";
-        root.querySelector(".ven-project-icon").appendChild(image);
-    }
-    root.querySelector(".ven-warn-icon").innerHTML = WARN_ICON;
-
-    const list = root.querySelector(".ven-version-list");
-    const detail = root.querySelector(".ven-detail");
-    const confirm = root.querySelector(".ven-confirm");
-    const cancel = root.querySelector(".ven-cancel");
-    const incompatible = root.querySelector(".ven-incompatible");
-    const searchBox = root.querySelector(".ven-search");
-
-    [confirm, cancel, incompatible].forEach(applyButtonScope);
-
-    cancel.append(iconSpan(X_SMALL), text("span", "", "Cancel"));
-    cancel.addEventListener("click", close);
-
-    let showIncompatible = false;
-    let query = "";
-    let selected = null;
-    let files = [];
-
-    const renderIncompatible = () => {
-        incompatible.replaceChildren(iconSpan(EYE_ICON),
-            text("span", "", showIncompatible ? "Hide incompatible" : "Show incompatible"));
-    };
-    renderIncompatible();
-
-    const setConfirm = (label, disabled) => {
-        confirm.replaceChildren(iconSpan(DOWNLOAD_SMALL), text("span", "", label));
-        confirm.disabled = disabled;
-    };
-
-    const renderDetail = () => {
-        detail.replaceChildren();
-        if (!selected) return;
-
-        const head = document.createElement("div");
-        head.className = V.detailHead;
-
-        const stack = document.createElement("div");
-        stack.className = V.detailStack;
-
-        const topRow = document.createElement("div");
-        topRow.className = V.detailRow;
-        const left = document.createElement("div");
-        left.className = V.detailLeft;
-        left.append(text("span", V.detailName, versionLabel(selected, info)), releaseChip(selected));
-        topRow.append(left, text("span", V.detailDate,
-            new Date(selected.fileDate).toLocaleDateString(undefined,
-                { year: "numeric", month: "long", day: "numeric" })));
-        stack.appendChild(topRow);
-
-        const metaRow = document.createElement("div");
-        metaRow.className = V.detailMeta;
-        metaRow.append(iconSpan(FILE_ICON), text("span", "font-medium", "Changelog"),
-            text("span", "text-secondary", "\u00b7"),
-            text("span", "text-secondary", `Minecraft ${gameVersionsOf(selected) || "any"}`));
-        stack.appendChild(metaRow);
-
-        head.appendChild(stack);
-        detail.appendChild(head);
-
-        const rule = document.createElement("div");
-        rule.className = V.divider;
-        rule.style.background = "var(--color-divider)";
-        detail.appendChild(rule);
-
-        const bodyWrap = document.createElement("div");
-        bodyWrap.className = V.bodyWrap;
-        const markdown = document.createElement("div");
-        markdown.className = V.markdown;
-        markdown.appendChild(text("div", "text-secondary text-sm", "Loading changelog..."));
-        bodyWrap.appendChild(markdown);
-        detail.appendChild(bodyWrap);
-
-        const wanted = selected.id;
-        cfGet(`/v1/mods/${entry.modId}/files/${wanted}/changelog`)
-            .then(data => {
-                if (selected?.id !== wanted) return;
-                const html = (data.data || "").trim();
-                markdown.replaceChildren(html
-                    ? safeChangelog(html)
-                    : text("div", "text-secondary text-sm", "No changelog for this version."));
-            })
-            .catch(() => {
-                if (selected?.id === wanted) {
-                    markdown.replaceChildren(text("div", "text-secondary text-sm", "Changelog unavailable."));
-                }
-            });
-
-        const current = selected.fileName === entry.fileName;
-        setConfirm(current ? "Current version" : `Switch to ${versionLabel(selected, info)}`, current);
-    };
-
-    const render = () => {
-        const matches = files.filter(file =>
-            versionLabel(file, info).toLowerCase().includes(query.toLowerCase()));
-
-        list.replaceChildren();
-        if (!matches.length) {
-            list.appendChild(text("div", "text-secondary text-sm p-2", "No versions found."));
-        }
-
-        for (const file of matches) {
-            const active = selected && file.id === selected.id;
-            const item = document.createElement("button");
-            item.type = "button";
-            item.setAttribute("role", "option");
-            item.setAttribute("aria-selected", String(!!active));
-            item.className = `${V.item} ${active ? V.itemSelected : V.itemIdle}`;
-
-            const inner = document.createElement("div");
-            inner.className = V.itemInner;
-
-            const side = document.createElement("div");
-            side.className = V.itemLeft;
-            side.append(releaseBadge(file), text("span", V.itemName, versionLabel(file, info)));
-            inner.appendChild(side);
-
-            if (file.fileName === entry.fileName) {
-                inner.appendChild(text("span", V.currentChip, "Current"));
-            }
-
-            item.appendChild(inner);
-            item.addEventListener("click", () => { selected = file; render(); });
-            list.appendChild(item);
-        }
-        renderDetail();
-    };
-
-    const load = async () => {
-        list.replaceChildren(text("div", "text-secondary text-sm p-2", "Loading versions..."));
-        const fetched = showIncompatible
-            ? await allFilesFor(entry.modId)
-            : await filesFor(entry.modId, instance, kind);
-        files = fetched
-            .filter(file => file.downloadUrl)
-            .sort((a, b) => new Date(b.fileDate) - new Date(a.fileDate));
-        selected = files.find(file => file.fileName === entry.fileName) || files[0] || null;
-        render();
-    };
-
-    searchBox.addEventListener("input", () => { query = searchBox.value.trim(); render(); });
-
-    incompatible.addEventListener("click", () => {
-        showIncompatible = !showIncompatible;
-        renderIncompatible();
-        load();
-    });
-
-    confirm.addEventListener("click", async () => {
-        if (!selected || selected.fileName === entry.fileName) return;
-        setConfirm("Switching...", true);
-        await applyUpdate(instance, kind, entry, selected, null);
-        close();
-    });
-
-    await load();
-}
-
-const UPDATER_PROPS = ["versions", "currentGameVersion", "currentLoader", "currentVersionId",
-    "isApp", "projectType", "projectIconUrl", "projectName", "header", "mode", "warning",
-    "actionLoading", "loading", "loadingChangelog", "actionDisabled", "actionDisabledTooltip"];
-const UPDATER_HANDLERS = ["onUpdate", "onCancel", "onVersionSelect", "onVersionHover"];
-
-const findUpdaterModal = () => findComponent(component =>
-    component.props
-    && "versions" in component.props
-    && "currentVersionId" in component.props
-    && typeof component.exposed?.show === "function");
-
-function asVersion(file, info) {
-    const tags = file.gameVersions || [];
-    return {
-        id: String(file.id),
-        version_number: versionLabel(file, info),
-        version_type: releaseName(file).toLowerCase(),
-        game_versions: tags.filter(tag => /^\d/.test(tag)),
-        loaders: tags.map(tag => tag.toLowerCase()).filter(tag => LOADER_IDS[tag]),
-        date_published: file.fileDate,
-        changelog: null,
-        file,
-    };
-}
-
-async function openVersionPicker(instance, kind, entry, info) {
-    const dialog = findUpdaterModal();
-    if (!dialog) return openFallbackVersionPicker(instance, kind, entry, info);
-
-    const originalProps = {};
-    for (const key of UPDATER_PROPS) originalProps[key] = dialog.props[key];
-    const originalHandlers = {};
-    for (const key of UPDATER_HANDLERS) originalHandlers[key] = dialog.vnode.props?.[key];
-
-    let finished = false;
-    const restore = () => {
-        if (finished) return;
-        finished = true;
-        for (const key of UPDATER_PROPS) dialog.props[key] = originalProps[key];
-        for (const key of UPDATER_HANDLERS) {
-            if (!dialog.vnode.props) continue;
-            if (originalHandlers[key] === undefined) delete dialog.vnode.props[key];
-            else dialog.vnode.props[key] = originalHandlers[key];
-        }
-        ML.refresh();
-    };
-
-    const setHandlers = handlers => {
-        dialog.vnode.props = dialog.vnode.props || {};
-        Object.assign(dialog.vnode.props, handlers);
-    };
-
-    const name = info?.name || entry.fileName;
-
-    dialog.props.versions = [];
-    dialog.props.currentVersionId = null;
-    dialog.props.currentGameVersion = instance.game_version;
-    dialog.props.currentLoader = instance.loader;
-    dialog.props.projectType = kind.projectType;
-    dialog.props.projectName = name;
-    dialog.props.projectIconUrl = info?.logo?.thumbnailUrl || info?.logo?.url || undefined;
-    dialog.props.isApp = true;
-    dialog.props.mode = "version";
-    dialog.props.header = undefined;
-    dialog.props.warning = undefined;
-    dialog.props.actionDisabledTooltip = undefined;
-    dialog.props.actionDisabled = false;
-    dialog.props.actionLoading = false;
-    dialog.props.loadingChangelog = false;
-    dialog.props.loading = true;
-    setHandlers({ onCancel: restore, onUpdate: () => {}, onVersionSelect: () => {}, onVersionHover: () => {} });
-    dialog.exposed.show(null, { switchMode: true });
-
-    const versions = (await allFilesFor(entry.modId))
-        .filter(file => file.downloadUrl)
-        .sort((a, b) => new Date(b.fileDate) - new Date(a.fileDate))
-        .map(file => asVersion(file, info));
-    const current = versions.find(version => version.file.fileName === entry.fileName);
-
-    let pending = 0;
-    const loadChangelog = async version => {
-        if (!version || version.changelog !== null) return;
-        const mine = ++pending;
-        dialog.props.loadingChangelog = true;
-        let markup = "";
-        try {
-            const data = await cfGet(`/v1/mods/${entry.modId}/files/${version.id}/changelog`);
-            markup = cleanHtml(data.data || "").trim();
-        } catch {
-            markup = "";
-        }
-        version.changelog = markup;
-        if (mine === pending) dialog.props.loadingChangelog = false;
-    };
-
-    setHandlers({
-        onCancel: restore,
-        onVersionHover: () => {},
-        onVersionSelect: version => loadChangelog(version),
-        onUpdate: async version => {
-            dialog.props.actionLoading = true;
-            try {
-                await applyUpdate(instance, kind, entry, version.file, null);
-            } catch (e) {
-                ML.notify(`${name}: ${e.message}`);
-            }
-            restore();
-        },
-    });
-
-    dialog.props.versions = versions;
-    dialog.props.currentVersionId = current?.id;
-    dialog.props.loading = false;
-    dialog.exposed.show(current?.id ?? versions[0]?.id, { switchMode: true });
-}
-
-function addSwitchButton(row, onClick) {
-    const actions = [...row.children].find(child =>
-        child.className.includes("justify-end")) || row.lastElementChild;
-    if (!actions || actions.querySelector(".ven-switch")) return;
-    if (row.querySelector('button[aria-label="Switch version"]')) return;
-
-    const slot = document.createElement("div");
-    slot.className = "ven-switch flex w-8 items-center justify-center";
-
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = ROW_BUTTON_CLASSES;
-    applyButtonScope(button);
-    button.setAttribute("aria-label", "Switch version");
-    button.innerHTML = SWAP_ICON;
-    button.addEventListener("click", event => {
-        event.preventDefault();
-        event.stopPropagation();
-        onClick();
-    });
-
-    slot.appendChild(button);
-    actions.insertBefore(slot, actions.firstChild);
 }
 
 function buildDropdown() {
@@ -2029,7 +1436,6 @@ const observer = new MutationObserver(() => {
     requestAnimationFrame(() => {
         scheduled = false;
         mount();
-        checkContentUpdates();
     });
 });
 
@@ -2044,6 +1450,7 @@ ML.findComponent = findComponent;
 
 ML.cf = {
     get: cfGet,
+    post: cfPost,
     info: modInfo,
     files: allFilesFor,
     versionLabel,
