@@ -1146,6 +1146,24 @@ async function applyPack(pack, instanceId, previous, report, reset = false) {
         .catch(() => ({ paths: [] }));
     const overrides = (extracted.paths || []).filter(isContentPath);
 
+    const current = new Map(before.map(item => [item.projectID, item]));
+    let refreshed = 0;
+    const progress = () => {
+        const record = packOf(instanceId);
+        if (record) {
+            ML.settings.set(packKey(instanceId), {
+                ...record,
+                files: [...current.values()],
+                overrides: [...new Set([...(record.overrides || []), ...overrides])],
+            });
+        }
+        if (Date.now() - refreshed > 2000) {
+            refreshed = Date.now();
+            ML.refresh({ queryKey: ["linkedModpackContent", instanceId] });
+        }
+    };
+    progress();
+
     const entries = pack.manifest.files || [];
     const files = [];
     const manual = [];
@@ -1180,6 +1198,8 @@ async function applyPack(pack, instanceId, previous, report, reset = false) {
                 if (old && old.path !== path) await removeContent(instanceId, old.path);
                 if (wasDisabled && !reset) await setEnabled(instanceId, path, false);
                 files.push({ projectID: entry.projectID, fileID: entry.fileID, path });
+                current.set(entry.projectID, { projectID: entry.projectID, fileID: entry.fileID, path });
+                progress();
             }
         } catch {
             blocked += 1;
@@ -1198,11 +1218,15 @@ async function applyPack(pack, instanceId, previous, report, reset = false) {
 
 async function installPackFile(file, mod, report = () => {}, options = {}) {
     const pack = await readPack(file, report);
+    const icon = mod.logo?.url
+        ? await ML.backend.get(`/download?url=${encodeURIComponent(mod.logo.url)}&name=${encodeURIComponent(`icon-${mod.id}.png`)}`)
+            .catch(() => null)
+        : null;
     try {
         report("Creating instance...");
         const request = { name: options.name || pack.manifest.name || mod.name, gameVersion: pack.gameVersion, loader: pack.loader.loader };
         if (pack.loader.version) request.loaderVersion = pack.loader.version;
-        if (options.iconPath) request.iconPath = options.iconPath;
+        if (icon?.path) request.iconPath = icon.path;
         const created = await ML.invoke("plugin:install|install_create_instance", { request });
 
         const instanceId = created.instance_id || created.instanceId;
@@ -1220,6 +1244,7 @@ async function installPackFile(file, mod, report = () => {}, options = {}) {
         return { instanceId, total: result.total, blocked: result.blocked };
     } finally {
         ML.backend.get(`/cleanup?path=${encodeURIComponent(pack.saved.path)}`).catch(() => {});
+        if (icon?.path) ML.backend.get(`/cleanup?path=${encodeURIComponent(icon.path)}`).catch(() => {});
     }
 }
 
@@ -1498,6 +1523,22 @@ function blockedNotice(blocked) {
     return box;
 }
 
+let renamedLinks = false;
+
+function curseForgeLabels() {
+    const onCurseForge = /^\/project\/cf\d+/.test(location.pathname);
+    if (!onCurseForge && !renamedLinks) return;
+
+    const [from, to] = onCurseForge
+        ? ["Open in Modrinth", "Open in CurseForge"]
+        : ["Open in CurseForge", "Open in Modrinth"];
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+        if (node.nodeValue.trim() === from) node.nodeValue = node.nodeValue.replace(from, to);
+    }
+    renamedLinks = onCurseForge;
+}
+
 function showBlocked() {
     const match = location.pathname.match(/^\/instance\/([^/]+)\/?$/);
     const blocked = (match && packOf(decodeURIComponent(match[1]))?.blocked) || [];
@@ -1690,6 +1731,7 @@ const observer = new MutationObserver(() => {
         scheduled = false;
         mount();
         showBlocked();
+        curseForgeLabels();
     });
 });
 

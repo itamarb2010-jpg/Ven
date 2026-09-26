@@ -295,29 +295,15 @@ async function installPackFromPage(args) {
     const file = files.find(candidate => candidate.id === Number(match?.[2])) || files[0];
     if (!info || !file) throw new Error("This pack's author has blocked downloads");
 
-    const icon = info.logo?.url
-        ? await ML.backend.get(`/download?url=${encodeURIComponent(info.logo.url)}&name=${encodeURIComponent(`icon-${modId}.png`)}`)
-            .catch(() => null)
-        : null;
-
-    const dropIcon = () => {
-        if (icon?.path) ML.backend.get(`/cleanup?path=${encodeURIComponent(icon.path)}`).catch(() => {});
-    };
-
     return new Promise((resolve, reject) => {
         ML.cf.installPackFile(file, info, () => {}, {
             name: location.title,
-            iconPath: icon?.path,
-            onCreated: created => {
-                dropIcon();
-                resolve(created);
-            },
+            onCreated: resolve,
         }).then(result => {
             ML.notify(result.blocked
                 ? `${info.name} installed, ${result.blocked} file(s) blocked by their authors`
                 : `${info.name} installed`);
         }).catch(error => {
-            dropIcon();
             reject(error);
             ML.notify(`${info.name}: ${error.message}`);
         });
