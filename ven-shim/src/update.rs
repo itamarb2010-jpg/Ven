@@ -43,6 +43,7 @@ fn sweep(exe: &Path) {
 
 fn download(asset: &serde_json::Value) -> Option<Vec<u8>> {
     let size = asset["size"].as_u64()?;
+    let expected = asset["digest"].as_str()?.strip_prefix("sha256:")?;
     let mut bytes = Vec::new();
     ureq::get(asset["browser_download_url"].as_str()?)
         .set("User-Agent", USER_AGENT)
@@ -53,9 +54,10 @@ fn download(asset: &serde_json::Value) -> Option<Vec<u8>> {
         .read_to_end(&mut bytes)
         .ok()?;
 
-    let expected = asset["digest"].as_str().and_then(|digest| digest.strip_prefix("sha256:"));
-    let intact = expected.map_or(true, |hash| format!("{:x}", Sha256::digest(&bytes)).eq_ignore_ascii_case(hash));
-    (bytes.len() as u64 == size && bytes.starts_with(b"MZ") && intact).then_some(bytes)
+    let intact = bytes.len() as u64 == size
+        && bytes.starts_with(b"MZ")
+        && format!("{:x}", Sha256::digest(&bytes)).eq_ignore_ascii_case(expected);
+    intact.then_some(bytes)
 }
 
 fn replace(exe: &Path, bytes: &[u8]) -> std::io::Result<()> {

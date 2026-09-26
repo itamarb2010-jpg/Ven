@@ -1,6 +1,6 @@
 const POPUPS = Symbol.for("modrinth:popupNotificationManager");
 const ALL_WINDOW_STATE = 63;
-const CHECK_EVERY = 60 * 1000;
+const CHECK_EVERY = 10 * 1000;
 
 const popups = () => document.querySelector("#app")?._vnode?.component?.provides?.[POPUPS];
 
