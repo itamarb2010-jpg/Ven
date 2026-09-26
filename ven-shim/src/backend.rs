@@ -283,6 +283,14 @@ pub fn handle(url: &str, headers: &serde_json::Value) -> Reply {
         pack_overrides(url)
     } else if url.starts_with("/fingerprints") {
         fingerprints(url, headers)
+    } else if url == "/update" {
+        json(crate::update::status().to_string(), 200)
+    } else if url == "/update/restart" {
+        if crate::update::request_restart() {
+            json(serde_json::json!({ "restarting": true }).to_string(), 200)
+        } else {
+            error("no update is ready", 409)
+        }
     } else {
         error("not found", 404)
     }

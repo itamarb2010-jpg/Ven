@@ -1,4 +1,3 @@
-const VERSION = "Ven 0.0.1";
 const TITLE = "Ven Settings";
 
 const icon = (paths, cls = "w-4 h-4 flex-shrink-0") =>
@@ -152,7 +151,7 @@ function buildModal() {
     words.className = "min-w-0";
     words.appendChild(text("div", "text-contrast font-extrabold text-lg leading-tight", "Ven"));
     words.appendChild(text("div", "text-secondary text-sm",
-        `${VERSION.replace("Ven ", "v")} - CurseForge for Modrinth App`));
+        `v${ML.version} - CurseForge for Modrinth App`));
 
     lockup.append(badge, words);
     body.appendChild(lockup);

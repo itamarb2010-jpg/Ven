@@ -4,6 +4,7 @@ mod backend;
 mod fingerprint;
 mod key;
 mod pack;
+mod update;
 
 use std::collections::HashMap;
 use std::net::TcpListener;
@@ -239,6 +240,7 @@ fn launch_and_inject(exe: &PathBuf, payload: &str) -> Option<(std::process::Chil
 
 fn main() {
     let Some(exe) = app_path() else { return };
+    update::start();
 
     let payload = BUNDLE;
 
@@ -249,6 +251,13 @@ fn main() {
         let child_pid = child.id();
         std::thread::spawn(move || serve(socket));
         let _ = child.wait();
+
+        if update::restart_requested() {
+            if wait_until_closed() {
+                update::launch();
+            }
+            return;
+        }
 
         if takeovers >= MAX_TAKEOVERS {
             return;
@@ -276,6 +285,10 @@ fn main() {
 
         ask_app_to_close();
         if !wait_until_closed() {
+            return;
+        }
+        if update::ready() {
+            update::launch();
             return;
         }
         takeovers += 1;

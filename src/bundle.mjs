@@ -12,6 +12,7 @@ function readAll(dir) {
 
 export function buildBundle() {
     const modules = readAll(join(root, "src", "core"));
+    const version = readFileSync(join(root, "ven-shim", "Cargo.toml"), "utf8").match(/^version = "([^"]+)"/m)[1];
 
     const body = modules.map(({ name, src }) =>
         `try { (function(ML){\n${src}\n})(window.__ML__); } catch (e) { console.error("[ML] ${name} failed:", e); }`
@@ -22,7 +23,7 @@ export function buildBundle() {
   if (window.__ML__ && window.__ML__.cleanups) {
     window.__ML__.cleanups.forEach(fn => { try { fn(); } catch (e) {} });
   }
-  window.__ML__ = { cleanups: [] };
+  window.__ML__ = { cleanups: [], version: ${JSON.stringify(version)} };
   console.log("[ML] Ven active");
   ${body}
 })();`;
