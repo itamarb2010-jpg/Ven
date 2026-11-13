@@ -109,8 +109,8 @@ let lastSignature = null;
 let lastPath = location.pathname;
 const listeners = new AbortController();
 
-const cfGet = path => ML.backend.get(`/cf${path}`);
-const cfPost = (path, body) => ML.backend.get(`/cf${path}`, { "x-body": JSON.stringify(body) });
+const cfGet = path => ML.backend.cf(path);
+const cfPost = (path, body) => ML.backend.cf(path, body);
 
 async function currentInstance() {
     const id = new URLSearchParams(location.search).get("i");
@@ -388,7 +388,7 @@ function rewireInstallButton(card, mod, instance, present) {
             ML.refresh();
             runSearch(true);
         } catch (e) {
-            report(e.message.slice(0, 26));
+            report(e.short || e.message.slice(0, 26));
             setTimeout(() => ML.resetButton(button, label), 4000);
         }
     };
@@ -407,7 +407,7 @@ function rewireInstallButton(card, mod, instance, present) {
                     ? `${mod.name} installed, ${result.blocked} file(s) blocked by their authors`
                     : `${mod.name} installed`);
             } catch (e) {
-                report(e.message.slice(0, 26));
+                report(e.short || e.message.slice(0, 26));
                 setTimeout(() => ML.resetButton(button, label), 4000);
             }
             return;
@@ -833,7 +833,7 @@ async function openFallbackInstallModal(mod, kind) {
                 ML.refresh();
                 close();
             } catch (e) {
-                report(e.message.slice(0, 26));
+                report(e.short || e.message.slice(0, 26));
                 setTimeout(() => ML.resetButton(install, "Install"), 4000);
             }
         });
@@ -939,7 +939,7 @@ async function openFallbackInstallModal(mod, kind) {
                             ML.notify(`${mod.name} installed to ${entry.instance.name}`);
                             ML.refresh();
                         } catch (e) {
-                            report(e.message.slice(0, 26));
+                            report(e.short || e.message.slice(0, 26));
                             setTimeout(() => ML.resetButton(action, "Install"), 4000);
                         }
                     });
@@ -1303,7 +1303,65 @@ function message(box, value) {
     box.replaceChildren(el);
 }
 
+const KEY_RETRY_SECONDS = 20;
+let keyRetry = null;
+
+function stopKeyRetry() {
+    clearInterval(keyRetry);
+    keyRetry = null;
+}
+
+function notice(box, title, body, ...actions) {
+    const panel = document.createElement("div");
+    panel.className = "flex flex-col gap-2 rounded-2xl border border-solid border-surface-5 bg-bg-raised p-4";
+    panel.append(text("div", "text-contrast font-semibold", title), text("div", "text-secondary text-sm", body));
+    if (actions.length) {
+        const row = document.createElement("div");
+        row.className = "mt-1 flex flex-wrap items-center gap-3";
+        row.append(...actions);
+        panel.appendChild(row);
+    }
+    box.replaceChildren(panel);
+}
+
+function settingsButton() {
+    const button = modalButton("Open Ven Settings", INSTALL_MODAL.base);
+    button.addEventListener("click", () => ML.ui.openSettings());
+    return button;
+}
+
+function waitForKey(box, current) {
+    const minutes = ML.cfKey.minutesSinceSaved();
+    const added = minutes < 1 ? "just now" : `${minutes} minute${minutes === 1 ? "" : "s"} ago`;
+    const check = modalButton("Check now", INSTALL_MODAL.base);
+    const status = text("span", "text-secondary text-sm", "");
+    let left = KEY_RETRY_SECONDS;
+    const countdown = () => { status.textContent = `Checking again in ${left}s`; };
+
+    const retry = () => {
+        stopKeyRetry();
+        check.disabled = true;
+        status.textContent = "Checking...";
+        runSearch(true, true);
+    };
+    check.addEventListener("click", retry);
+
+    notice(box, "CurseForge is still activating your API key",
+        `You added it ${added}, and new keys take 5 to 10 minutes to start working. You don't need to do anything: Ven keeps checking and shows results here as soon as the key works.`,
+        check, status);
+    countdown();
+
+    stopKeyRetry();
+    keyRetry = setInterval(() => {
+        if (lastSignature !== current || !box.isConnected) return stopKeyRetry();
+        left -= 1;
+        if (left <= 0) retry();
+        else countdown();
+    }, 1000);
+}
+
 function showModrinth() {
+    stopKeyRetry();
     for (const el of document.querySelectorAll(".app-viewport .search")) {
         el.style.display = "";
     }
@@ -1321,7 +1379,7 @@ function showCurseForge() {
     runSearch(true);
 }
 
-async function runSearch(force = false) {
+async function runSearch(force = false, quiet = false) {
     if (platform !== "curseforge" || !onSupportedPage()) return;
 
     const box = ourResults(true);
@@ -1331,14 +1389,17 @@ async function runSearch(force = false) {
     const current = signature(filters);
     if (!force && current === lastSignature) return;
     lastSignature = current;
+    stopKeyRetry();
 
     await ML.cfKey.ready;
     if (!ML.cfKey.saved) {
-        message(box, "Add your CurseForge API key in Ven Settings.");
+        notice(box, "Add your CurseForge API key",
+            "Ven needs your own CurseForge API key to search CurseForge. Get one at console.curseforge.com and paste it into Ven Settings.",
+            settingsButton());
         return;
     }
 
-    message(box, "Searching CurseForge...");
+    if (!quiet) message(box, "Searching CurseForge...");
     captureTemplate();
 
     try {
@@ -1378,7 +1439,16 @@ async function runSearch(force = false) {
         if (ignored.length) message(box, ignored.join(" "));
         box.appendChild(list);
     } catch (e) {
-        message(box, `CurseForge search failed: ${e.message}`);
+        if (lastSignature !== current) return;
+        if (e.code === "key-activating") {
+            waitForKey(box, current);
+        } else if (e.code === "key-rejected") {
+            notice(box, "CurseForge didn't accept your API key",
+                "Copy the whole key again from console.curseforge.com and paste it into Ven Settings.",
+                settingsButton());
+        } else {
+            message(box, `CurseForge search failed: ${e.message}`);
+        }
     }
 }
 
@@ -1723,6 +1793,8 @@ document.addEventListener("input", event => {
     }
 }, { capture: true, signal: listeners.signal });
 
+window.addEventListener("ven-key-changed", () => runSearch(true), { signal: listeners.signal });
+
 let scheduled = false;
 const observer = new MutationObserver(() => {
     if (scheduled) return;
@@ -1766,6 +1838,7 @@ ML.cleanups.push(() => {
     observer.disconnect();
     listeners.abort();
     clearTimeout(searchTimer);
+    stopKeyRetry();
     document.getElementById("ven-platform")?.remove();
     document.getElementById("ven-blocked")?.remove();
     showModrinth();

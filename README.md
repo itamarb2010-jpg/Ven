@@ -22,6 +22,8 @@ Ven needs your own CurseForge API key.
 2. Copy your key.
 3. In the Modrinth App, click the puzzle-piece button above **Settings** and paste the key into **CurseForge API key**.
 
+CurseForge takes 5 to 10 minutes to activate a new key. Until then, the CurseForge search shows a waiting message and keeps checking, and results appear by themselves once the key works.
+
 The key is stored encrypted on your pc and is only sent to CurseForge.
 
 ## Use

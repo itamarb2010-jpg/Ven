@@ -69,7 +69,7 @@ function ensureStyle() {
     document.head.appendChild(style);
 }
 
-ML.ui = { text, icon, ensureStyle, CLOSE_ICON, CLOSE_BUTTON_CLASSES };
+ML.ui = { text, icon, ensureStyle, CLOSE_ICON, CLOSE_BUTTON_CLASSES, openSettings: openModal };
 
 function linkButton(link) {
     const button = document.createElement("button");
@@ -88,16 +88,22 @@ function linkButton(link) {
     return button;
 }
 
-function apiKeyField() {
+function settingRow(title, description) {
     const row = document.createElement("div");
     row.className = "flex items-center justify-between gap-4";
 
     const label = document.createElement("div");
     label.className = "min-w-0";
-    label.appendChild(text("div", "text-contrast font-semibold text-sm", "CurseForge API key"));
-    label.appendChild(text("div", "text-secondary text-xs",
-        "Needed to browse and install CurseForge content. Get one at console.curseforge.com."));
+    label.appendChild(text("div", "text-contrast font-semibold text-sm", title));
+    label.appendChild(text("div", "text-secondary text-xs", description));
     row.appendChild(label);
+
+    return row;
+}
+
+function apiKeyField() {
+    const row = settingRow("CurseForge API key",
+        "Needed to browse and install CurseForge content. Get one at console.curseforge.com.");
 
     const input = document.createElement("input");
     input.type = "password";
@@ -106,13 +112,36 @@ function apiKeyField() {
     input.placeholder = "paste your key";
     const masked = () => (ML.cfKey.saved ? "\u2022".repeat(ML.cfKey.length) : "");
     input.value = masked();
+
+    const status = text("div", "text-secondary text-xs mt-1", "");
+    status.hidden = true;
+    row.firstElementChild.appendChild(status);
+    const say = value => {
+        status.textContent = value;
+        status.hidden = !value;
+    };
+
     input.addEventListener("change", async () => {
+        say("");
         await ML.cfKey.set(input.value.trim());
         input.value = masked();
+        if (ML.cfKey.saved) await checkKey(say);
     });
     row.appendChild(input);
 
     return row;
+}
+
+async function checkKey(say) {
+    say("Checking the key with CurseForge...");
+    try {
+        await ML.backend.cf("/v1/games/432");
+        say("Key works.");
+    } catch (e) {
+        say(e.code === "key-activating"
+            ? "Saved. CurseForge takes 5 to 10 minutes to activate a new key, and CurseForge results will show up by themselves once it's ready."
+            : `Saved, but the check failed: ${e.message}`);
+    }
 }
 
 function buildModal() {
